@@ -1,0 +1,2 @@
+# WSL's bash runs the .sh files: keep LF everywhere (PowerShell reads LF scripts fine)
+* text=auto eol=lf

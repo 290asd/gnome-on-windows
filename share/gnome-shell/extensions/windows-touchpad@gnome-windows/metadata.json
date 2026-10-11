@@ -1,0 +1,6 @@
+{
+  "uuid": "windows-touchpad@gnome-windows",
+  "name": "Windows touchpad and Super key",
+  "description": "GNOME's own touchpad swipes and Super key for the touchpad and keyboard Windows owns: winbridge.py reads them and sends them here.",
+  "shell-version": ["46"]
+}

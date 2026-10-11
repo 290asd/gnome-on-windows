@@ -1,0 +1,7 @@
+__pycache__/
+# generated per machine by export-apps.ps1
+share/applications/windows-*.desktop
+share/icons/
+share/windows-apps.json
+# written by win-launch.sh
+gnome-launch.txt

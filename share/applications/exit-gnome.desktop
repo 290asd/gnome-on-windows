@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=Exit GNOME
+Name[fi]=Poistu GNOMEsta
+Comment=Close GNOME and return to Windows
+Comment[fi]=Sulje GNOME ja palaa Windowsiin
+Keywords=exit;quit;logout;windows;poistu;lopeta;sulje;
+Exec=pkill -x gnome-shell
+Icon=system-log-out
+Terminal=false

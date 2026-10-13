@@ -38,8 +38,12 @@ export GNOME_WINDOWS_DIR="$(dirname "$(readlink -f "$0")")"
 # environment: a Wayland display that doesn't exist (WSLg's wayland-0 is GTK's default even when unset) makes it
 # an X11 window, which fullscreen_when_shown can fullscreen (it has no fullscreen of its own, and a WSLg Wayland
 # window can't be made fullscreen from outside); its GDK scale becomes the monitor's, its size follows the window.
+# GTK's cairo renderer for it: WSLg's X server has no DRI3, so the GL one sent every frame GPU -> CPU -> X:
+# a full-screen steady load reached 5 fps through it, 13 with cairo (GNOME 46's --nested: 29).
+# ponytail: GNOME's own apps inherit GDK_SCALE and GSK_RENDERER too; launching the viewer ourselves
+# (gnome-shell --devkit --headless, then /usr/libexec/mutter-devkit) would keep them to it.
 if [ "$(gnome-shell --version | grep -o '[0-9]\+' | head -1)" -ge 49 ]; then
-    export SHELL_CMD="env WAYLAND_DISPLAY=devkit-viewer-on-x11 GDK_SCALE=${GNOME_SCALE:-2} gnome-shell --devkit"
+    export SHELL_CMD="env WAYLAND_DISPLAY=devkit-viewer-on-x11 GDK_SCALE=${GNOME_SCALE:-2} GSK_RENDERER=cairo gnome-shell --devkit"
 else
     export SHELL_CMD="gnome-shell --nested"
 fi

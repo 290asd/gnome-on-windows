@@ -444,7 +444,7 @@ class Overlay:
     def __init__(self):
         self.hwnd = 0  # the window shown natively now
         self.band = None  # its title-bar band on screen (left, top, right, bottom), see mouse_hook
-        self.want = {"o": 0}  # the extension's last word: {o: hwnd, x, y, w, h} of the mirror's frame
+        self.want = {"o": 0}  # the extension's last word: {o: hwnd, x, y, w, h, sw: GNOME's width} of the mirror's frame
         self.areas = {}  # hwnd -> its mirror's content size in GNOME ("area" events)
         # reentrant: mouse_hook's hit test waits in SendMessage, where the next mouse event can call it again
         self.lock = threading.RLock()
@@ -513,8 +513,10 @@ class Overlay:
         user32.GetWindowRect(hwnd, ctypes.byref(wr))
         user32.ClientToScreen(hwnd, ctypes.byref(pt))
         dx, dy = pt.x - wr.left, pt.y - wr.top  # client area within the window
+        # GNOME's units -> screen pixels: 1 on GNOME 46 (physical layout), its scale on 49+ (logical)
+        k = (gr.right - gr.left) / want.get("sw", gr.right - gr.left)
         # the content fills the bottom of GNOME's frame, under GTK's title bar if it has one
-        x, y = gr.left + want["x"] - dx, gr.top + want["y"] + want["h"] - ah - dy
+        x, y = gr.left + round(want["x"] * k) - dx, gr.top + round((want["y"] + want["h"]) * k) - ah - dy
         # only the client area: GNOME's title bar shows around it (the capture sees the clipped window
         # just like the screen, so nothing that should show in the mirror may be cut off)
         if not user32.SetWindowRgn(hwnd, gdi32.CreateRectRgn(dx, dy, dx + cw, dy + ch), True):

@@ -155,7 +155,8 @@ export default class WindowsTouchpad {
             actor.translation_x !== 0 || actor.translation_y !== 0)
             return {o: 0};
         const r = win.get_frame_rect();
-        return {o: hwnd, x: r.x, y: r.y, w: r.width, h: r.height};
+        // sw: GNOME's width in the same units (GNOME 46 lays out in physical pixels, 49+ in logical ones)
+        return {o: hwnd, x: r.x, y: r.y, w: r.width, h: r.height, sw: global.stage.width};
     }
 
     _write(connection, line) {

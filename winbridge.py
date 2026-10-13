@@ -3,13 +3,16 @@
 Each app window gets its own connection to gnomebridge.py: its client area is captured with
 Windows.Graphics.Capture (PrintWindow polling as fallback) and only the changed rectangles are
 streamed; mouse/keyboard/close events coming back are posted to the window as Win32 messages.
-New windows (including dialogs) appear, closed ones disappear.
+New windows (including dialogs) appear, closed ones disappear. The focused one is shown natively
+over its mirror (Overlay): real window, real input, no stream in between. Notification-area icons
+become buttons in GNOME's top bar (Tray).
 
     py winbridge.py [port]          needs: pip install numpy; pip install --no-deps windows-capture
 
-ponytail: PostMessage input, so Ctrl/Alt shortcuts and apps that read raw input (games, some
-UWP/Chromium apps) don't react; SendInput with a focus dance is the upgrade path.
+ponytail: mirrors not shown natively get PostMessage input, so Ctrl/Alt shortcuts and apps that read
+raw input (games, some UWP/Chromium apps) don't react there; the native one has the real keyboard.
 """
+import base64
 import ctypes
 import ctypes.wintypes as wt
 import json
@@ -21,6 +24,8 @@ import sys
 import threading
 import time
 import types
+import uuid
+import winreg
 import zlib
 
 import numpy as np
@@ -65,6 +70,9 @@ user32.SetWindowLongPtrW.restype = ctypes.c_ssize_t
 user32.NotifyWinEvent.argtypes = [wt.DWORD, H, wt.LONG, wt.LONG]
 user32.GetWindowThreadProcessId.argtypes = [H, ctypes.POINTER(wt.DWORD)]
 user32.SetWindowPos.argtypes = [H, H, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int, wt.UINT]
+user32.SetWindowRgn.argtypes = [H, wt.HRGN, wt.BOOL]
+user32.mouse_event.argtypes = [wt.DWORD, wt.DWORD, wt.DWORD, wt.DWORD, ctypes.c_size_t]
+gdi32.CreateRectRgn.restype = wt.HRGN
 dwmapi.DwmGetWindowAttribute.argtypes = [H, wt.DWORD, ctypes.c_void_p, wt.DWORD]
 kernel32.OpenProcess.restype = wt.HANDLE
 kernel32.QueryFullProcessImageNameW.argtypes = [wt.HANDLE, wt.DWORD, wt.LPWSTR, ctypes.POINTER(wt.DWORD)]
@@ -75,6 +83,8 @@ kernel32.SetProcessInformation.argtypes = [wt.HANDLE, ctypes.c_int, ctypes.c_voi
 user32.FindWindowExW.argtypes = [H, H, wt.LPCWSTR, wt.LPCWSTR]
 user32.FindWindowExW.restype = H
 user32.GetForegroundWindow.restype = H
+user32.GetAsyncKeyState.argtypes = [ctypes.c_int]
+user32.GetAsyncKeyState.restype = ctypes.c_short
 user32.SetForegroundWindow.argtypes = [H]
 user32.SendMessageTimeoutW.argtypes = [H, wt.UINT, wt.WPARAM, wt.LPARAM, wt.UINT, wt.UINT, ctypes.POINTER(ctypes.c_ssize_t)]
 gdi32.CreateCompatibleDC.argtypes = [wt.HDC]
@@ -227,14 +237,19 @@ def focus(hwnd):
 
 
 def gnome_window():
-    return user32.FindWindowExW(None, None, "RAIL_WINDOW", "gnome-shell (Ubuntu-24.04)")
+    return user32.FindWindowExW(None, None, "RAIL_WINDOW", f"gnome-shell ({os.environ.get('GNOME_DISTRO', 'Ubuntu-24.04')})")
 
 
 def keep_behind_gnome(hwnd):
-    """A newly opened Windows window may pop up over fullscreen GNOME: send it under, focus back to GNOME."""
-    user32.SetWindowPos(hwnd, H(1), 0, 0, 0, 0, 0x1 | 0x2 | 0x10)  # HWND_BOTTOM, NOSIZE | NOMOVE | NOACTIVATE
+    """A newly mirrored window may be minimized (captures as black) or pop up over fullscreen GNOME: show
+    it under GNOME, focus back to GNOME. Without GNOME the windows are the user's again: hands off."""
     gnome = gnome_window()
-    if gnome and user32.GetForegroundWindow() == hwnd:
+    if not gnome:
+        return
+    if user32.IsIconic(hwnd):
+        user32.ShowWindow(hwnd, 4)  # SW_SHOWNOACTIVATE
+    user32.SetWindowPos(hwnd, H(1), 0, 0, 0, 0, 0x1 | 0x2 | 0x10)  # HWND_BOTTOM, NOSIZE | NOMOVE | NOACTIVATE
+    if user32.GetForegroundWindow() == hwnd:
         focus(gnome)
 
 
@@ -354,7 +369,8 @@ def raise_under_gnome(hwnd):
     ponytail: two mirrors visible side by side in GNOME can still cover each other on the Windows side,
     so only the focused one updates; placing the Windows windows apart is the upgrade path."""
     gnome = gnome_window()
-    if gnome:  # SetWindowPos after NULL would mean HWND_TOP: in front of GNOME
+    # SetWindowPos after NULL would mean HWND_TOP: in front of GNOME. The native one stays there (Overlay)
+    if gnome and hwnd != overlay.hwnd:
         user32.SetWindowPos(hwnd, gnome, 0, 0, 0, 0, 0x1 | 0x2 | 0x10)  # NOSIZE | NOMOVE | NOACTIVATE
         # Chromium only rechecks occlusion on events like this one, not on a z-order change
         user32.NotifyWinEvent(0x800B, hwnd, 0, 0)  # EVENT_OBJECT_LOCATIONCHANGE, OBJID_WINDOW, CHILDID_SELF
@@ -400,6 +416,123 @@ def hit_test(hwnd, x, y):
 
 # WM_NCHITTEST results GNOME should handle itself: caption, min/max/close buttons, resize edges
 TITLEBAR_HITS = {2, 8, 9, 20, 10, 11, 12, 13, 14, 15, 16, 17}
+
+
+def gnome_in_front():
+    """GNOME has the foreground, or the window shown natively inside it (Overlay) does."""
+    fg = user32.GetForegroundWindow()
+    return bool(fg) and fg in (gnome_window(), overlay.hwnd)
+
+
+# Top band of a window that draws its own title bar (Chromium tab strips, Store apps) where presses on
+# the native window are hit-tested, to give title-bar presses to GNOME (Overlay.mouse_hook). Kept
+# narrow: the hit test asks the app, while Windows waits for the hook.
+# ponytail: calibration knob, a guess at the tallest common title bar
+CAPTION_DIP = 40
+OWN_PRESS = 0x57424E47  # dwExtraInfo of the press mouse_hook makes itself, so it lets that one pass
+
+
+class Overlay:
+    """The focused mirror's real window, laid exactly over the mirror and on top of GNOME while nothing
+    of GNOME's own covers or moves it (the windows-touchpad extension says when). The app then draws
+    through DWM at the display's rate and gets real mouse and keyboard input; nothing goes through the
+    capture and the stream. It is clipped to its client area, so GNOME's title bar shows around it.
+    Otherwise it goes back under GNOME, where the mirror shows it as before.
+    ponytail: only the focused window; the others stay streamed. A killed winbridge.py leaves it
+    clipped and on top (start-gnome.ps1 stops GNOME first, which ends it cleanly)."""
+
+    def __init__(self):
+        self.hwnd = 0  # the window shown natively now
+        self.band = None  # its title-bar band on screen (left, top, right, bottom), see mouse_hook
+        self.want = {"o": 0}  # the extension's last word: {o: hwnd, x, y, w, h, sw: GNOME's width} of the mirror's frame
+        self.areas = {}  # hwnd -> its mirror's content size in GNOME ("area" events)
+        # reentrant: mouse_hook's hit test waits in SendMessage, where the next mouse event can call it again
+        self.lock = threading.RLock()
+
+    def update(self, want=None):
+        """New state from the extension; None checks the last one again."""
+        with self.lock:
+            if want is not None:
+                self.want = want
+            old, self.hwnd = self.hwnd, self.place(self.want)
+            if old == self.hwnd:
+                return
+            print("* native:", text(user32.GetWindowTextW, self.hwnd) if self.hwnd else "-")
+            if old:
+                self.drop(old)
+            # the keyboard follows (if GNOME or the old one had it): to the app itself, not through the
+            # mirror, or back to GNOME
+            gnome, fg = gnome_window(), user32.GetForegroundWindow()
+            target = self.hwnd or gnome
+            if gnome and fg and fg in (gnome, old) and fg != target:
+                focus(target)
+
+    def drop(self, hwnd):
+        """Back under GNOME, unclipped (self.hwnd no longer names it)."""
+        user32.SetWindowRgn(hwnd, None, True)
+        user32.SetWindowPos(hwnd, H(-2), 0, 0, 0, 0, 0x1 | 0x2 | 0x10)  # HWND_NOTOPMOST, NOSIZE | NOMOVE | NOACTIVATE
+        raise_under_gnome(hwnd)
+
+    def mouse_hook(self, code, wparam, lparam):
+        """Low-level mouse hook: a left press on the native window's own title bar (caption, its buttons,
+        edges) belongs to GNOME, as on the mirror. Swallow it, drop the window under GNOME and press
+        again: that press lands on the mirror, whose hit test lets GNOME move, maximize, close..."""
+        band = self.band
+        if code == 0 and wparam == 0x201 and band:  # HC_ACTION, WM_LBUTTONDOWN
+            m = MSLLHOOKSTRUCT.from_address(lparam)
+            x, y = m.pt.x, m.pt.y
+            if m.dwExtraInfo != OWN_PRESS and band[0] <= x < band[2] and band[1] <= y < band[3]:
+                with self.lock:
+                    hwnd = self.hwnd
+                    if hwnd and hit_test(hwnd, x - band[0], y - band[1]) in TITLEBAR_HITS:
+                        self.hwnd, self.band = 0, None
+                        print("* native: - (title bar press)")
+                        self.drop(hwnd)
+                        user32.mouse_event(0x2, 0, 0, 0, OWN_PRESS)  # MOUSEEVENTF_LEFTDOWN
+                        return 1
+        return user32.CallNextHookEx(None, code, wparam, lparam)
+
+    def resized(self, hwnd):
+        """The window or its mirror changed size: maybe they agree now."""
+        if hwnd == self.want.get("o"):
+            self.update()
+
+    def place(self, want):
+        """Lay the window over its mirror and return it, or 0 if it can't be shown there now."""
+        self.band = None
+        hwnd, gnome = want.get("o", 0), gnome_window()
+        if not hwnd or not gnome or not user32.IsWindow(hwnd):
+            return 0
+        cw, ch = client_size(hwnd)
+        aw, ah = self.areas.get(hwnd, (0, 0))
+        # the mirror follows a resize with a delay (see gnomebridge.py's Mirror.on_size): wait for it
+        if abs(aw - cw) > 2 or abs(ah - ch) > 2:
+            return 0
+        gr, wr, pt = wt.RECT(), wt.RECT(), wt.POINT(0, 0)
+        user32.GetWindowRect(gnome, ctypes.byref(gr))
+        user32.GetWindowRect(hwnd, ctypes.byref(wr))
+        user32.ClientToScreen(hwnd, ctypes.byref(pt))
+        dx, dy = pt.x - wr.left, pt.y - wr.top  # client area within the window
+        # GNOME's units -> screen pixels: 1 on GNOME 46 (physical layout), its scale on 49+ (logical)
+        k = (gr.right - gr.left) / want.get("sw", gr.right - gr.left)
+        # the content fills the bottom of GNOME's frame, under GTK's title bar if it has one
+        x, y = gr.left + round(want["x"] * k) - dx, gr.top + round((want["y"] + want["h"]) * k) - ah - dy
+        # only the client area: GNOME's title bar shows around it (the capture sees the clipped window
+        # just like the screen, so nothing that should show in the mirror may be cut off)
+        if not user32.SetWindowRgn(hwnd, gdi32.CreateRectRgn(dx, dy, dx + cw, dy + ch), True):
+            return 0  # e.g. an app running as administrator
+        # Topmost: GNOME coming to the front can't cover it then. A plain HWND_TOP would not even get
+        # over GNOME: Windows ignores it from this background process while GNOME has the foreground.
+        if not user32.SetWindowPos(hwnd, H(-1), x, y, 0, 0, 0x1 | 0x10):  # HWND_TOPMOST, NOSIZE | NOACTIVATE
+            user32.SetWindowRgn(hwnd, None, True)
+            return 0
+        if draws_own_titlebar(hwnd):
+            left, top = x + dx, y + dy
+            self.band = (left, top, left + cw, top + int(CAPTION_DIP * user32.GetDpiForWindow(hwnd) / 96))
+        return hwnd
+
+
+overlay = Overlay()
 
 
 BUTTONS = {1: (0x201, 0x202, 0x1), 2: (0x207, 0x208, 0x10), 3: (0x204, 0x205, 0x2)}  # GDK button -> (down, up, MK_)
@@ -471,6 +604,10 @@ class Input:
             extra_h = (wr.bottom - wr.top) - cr.bottom
             user32.SetWindowPos(self.hwnd, None, 0, 0, ev["w"] + extra_w, ev["h"] + extra_h,
                                 0x2 | 0x4 | 0x10)  # NOMOVE | NOZORDER | NOACTIVATE
+            overlay.resized(self.hwnd)
+        elif t == "area":  # the mirror's content size in GNOME, right away (resize waits for the drag's end)
+            overlay.areas[self.hwnd] = (ev["w"], ev["h"])
+            overlay.resized(self.hwnd)
 
 
 hid = ctypes.WinDLL("hid")
@@ -608,9 +745,8 @@ class Swipes:
                 self.send("end", self.fingers, 0.0, 0.0)
             self.fingers = 0
         if not self.fingers and n >= 3:
-            gnome = gnome_window()
             self.fingers = n
-            self.active = bool(gnome) and user32.GetForegroundWindow() == gnome and self.send("begin", n, 0.0, 0.0)
+            self.active = gnome_in_front() and self.send("begin", n, 0.0, 0.0)
         elif self.fingers and self.active:
             both = contacts.keys() & self.last.keys()
             if both:
@@ -622,34 +758,92 @@ class Swipes:
 
 
 class GnomeShell:
-    """Messages as JSON lines to the GNOME Shell extension windows-touchpad@gnome-windows. Sent by a
-    thread of its own: the keyboard hook has to return at once, or every key press on Windows waits."""
+    """JSON lines with the GNOME Shell extension windows-touchpad@gnome-windows: swipes, the Super key and
+    tray icons out, where the focused mirror is and tray clicks (for on_line) in. Out goes through a thread
+    of its own: the keyboard hook has to return at once, or every key press on Windows waits."""
 
-    def __init__(self, port):
-        self.port, self.lines = port, queue.Queue()
-        threading.Thread(target=self.run, daemon=True).start()
+    def __init__(self, port, on_line):
+        self.port, self.on_line, self.out, self.sock = port, on_line, queue.Queue(), None
+        threading.Thread(target=self.send_loop, daemon=True).start()
+        threading.Thread(target=self.read_loop, daemon=True).start()
 
     def __call__(self, **msg):
-        self.lines.put((json.dumps(msg) + "\n").encode())
+        self.out.put((json.dumps(msg) + "\n").encode())
         return True
 
-    def run(self):
-        sock = None
+    def do(self, fn):
+        """Run fn() on the sending thread, in order with the messages."""
+        self.out.put(fn)
+
+    def send_loop(self):
         while True:
-            line = self.lines.get()
-            for _ in range(2):  # a connection from before a GNOME restart gets one retry
+            item, sock = self.out.get(), self.sock
+            if callable(item):
+                item()
+            elif sock:  # not connected: GNOME is (re)starting, this one is lost
                 try:
-                    if not sock:
-                        sock = socket.create_connection(("localhost", self.port), timeout=0.5)
-                        sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)  # every swipe update counts
-                    sock.sendall(line)
-                    break
+                    sock.sendall(item)
                 except OSError:
-                    sock = None
+                    pass
+
+    def read_loop(self):
+        """Stay connected, also across GNOME restarts."""
+        while True:
+            try:
+                sock = socket.create_connection(("localhost", self.port), timeout=0.5)
+            except OSError:
+                time.sleep(1)
+                continue
+            sock.settimeout(None)
+            sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)  # every swipe update counts
+            self.sock = sock
+            try:
+                for line in sock.makefile("r", encoding="utf-8"):
+                    self.on_line(json.loads(line))
+            except (OSError, ValueError):
+                pass
+            self.sock = None
+            sock.close()
+            self.on_line({"o": 0})  # GNOME is gone: nothing to show natively
+            time.sleep(1)
+
+
+def hkcu(key, name, default=None):
+    try:
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, key) as k:
+            return winreg.QueryValueEx(k, name)[0]
+    except OSError:
+        return default
+
+
+def appearance():
+    """Windows' dark mode and desktop wallpaper, for the extension to set in GNOME. v changes with the
+    file, also when a slideshow or Spotlight rewrites the same one."""
+    look = {"dark": hkcu(r"Software\Microsoft\Windows\CurrentVersion\Themes\Personalize", "AppsUseLightTheme", 1) == 0}
+    # SPI_GETDESKWALLPAPER, not the registry value: that can be stale, and under the py launcher's app
+    # container it is a virtualized one. Empty: a solid color, left alone
+    buf = ctypes.create_unicode_buffer(1024)
+    user32.SystemParametersInfoW(0x73, len(buf), buf, 0)
+    path = buf.value
+    if path and not os.path.exists(path):  # the original was deleted: Windows still shows its own copy
+        path = os.path.join(os.environ["APPDATA"], r"Microsoft\Windows\Themes\TranscodedWallpaper")
+    try:
+        st = os.stat(path)
+    except OSError:
+        return look
+    # size too: a half-written file may already have its final mtime
+    look["v"] = f"{st.st_mtime_ns}-{st.st_size}"
+    look["wallpaper"] = f"/mnt/{path[0].lower()}{path[2:]}".replace("\\", "/")  # ponytail: default WSL automount
+    return look
 
 
 class KBDLLHOOKSTRUCT(ctypes.Structure):
     _fields_ = [("vkCode", wt.DWORD), ("scanCode", wt.DWORD), ("flags", wt.DWORD), ("time", wt.DWORD),
+                ("dwExtraInfo", ctypes.c_size_t)]
+
+
+class MSLLHOOKSTRUCT(ctypes.Structure):
+    _fields_ = [("pt", wt.POINT), ("mouseData", wt.DWORD), ("flags", wt.DWORD), ("time", wt.DWORD),
                 ("dwExtraInfo", ctypes.c_size_t)]
 
 
@@ -662,44 +856,418 @@ kernel32.GetModuleHandleW.argtypes = [wt.LPCWSTR]
 kernel32.GetModuleHandleW.restype = wt.HMODULE
 
 SUPER_KEYS = {0x5B: 125, 0x5C: 126}  # VK_LWIN / VK_RWIN -> evdev KEY_LEFTMETA / KEY_RIGHTMETA
+# time for GNOME's window to get the keyboard over RDP after it comes to the front.
+# ponytail: calibration knob, a guess; Super pressed on a native window does nothing if too short
+FOCUS_SETTLE_S = 0.1
+# GNOME shortcuts taken from the window shown natively: their keys (Tab, Left, Up, Right, Down) and
+# modifiers (left/right Shift and Ctrl, left Alt), VK -> evdev. Not right Alt: on many layouts it is
+# AltGr, which Windows reports as right Alt plus a left Ctrl.
+SHORTCUT_KEYS = {0x09: 15, 0x25: 105, 0x26: 103, 0x27: 106, 0x28: 108}
+MODIFIERS = {0xA0: 42, 0xA1: 54, 0xA2: 29, 0xA3: 97, 0xA4: 56}
 
 
-class SuperKey:
-    """The Windows keys as GNOME's Super: pressed while GNOME is in front, they never reach Windows (no
-    Start menu, no Win+X shortcuts) but are pressed in GNOME by the extension. The other keys still go
-    through RDP and combine with it there, so Super+A, Super+arrows and so on work too."""
+class GnomeKeys:
+    """Keys that belong to GNOME, taken from Windows by a low-level keyboard hook.
 
-    def __init__(self, send):
-        self.send, self.held = send, set()
+    The Windows keys as GNOME's Super: pressed while GNOME (or a window shown natively in it, see
+    Overlay) is in front, they never reach Windows (no Start menu, no Win+X shortcuts) but are pressed
+    in GNOME by the extension. The other keys still go through RDP and combine with it there, so
+    Super+A, Super+arrows and so on work too.
+
+    Alt+Tab and Ctrl+Alt+arrows (with Shift too) pressed while the native window has the keyboard:
+    the keyboard moves to GNOME, and the extension presses the modifiers held, then the key, there.
+    Until those modifiers are released the shortcut's keys keep going that way: Alt+Tab+Tab walks
+    GNOME's switcher."""
+
+    def __init__(self, shell):
+        self.shell, self.held = shell, set()
+        self.mods = set()  # modifiers pressed in GNOME for a shortcut, until they are released
+        self.taps = set()  # shortcut keys whose press was swallowed, so their release is too
 
     def hook(self, code, wparam, lparam):
         k = KBDLLHOOKSTRUCT.from_address(lparam)
-        evdev = SUPER_KEYS.get(k.vkCode)
-        if code == 0 and evdev and not k.flags & 0x10:  # HC_ACTION, a Windows key, not injected
+        if code == 0 and not k.flags & 0x10:  # HC_ACTION, not injected
             down = wparam in (0x100, 0x104)  # WM_KEYDOWN, WM_SYSKEYDOWN
-            gnome = gnome_window()
-            if down and k.vkCode not in self.held and gnome and user32.GetForegroundWindow() == gnome:
-                self.held.add(k.vkCode)
-                self.send(k=evdev, down=True)
+            if self.super_key(k.vkCode, down) or self.shortcut(k.vkCode, down):
                 return 1  # swallowed: Windows never sees it
-            if k.vkCode in self.held:  # its auto-repeats and release (even if GNOME lost the front since)
-                if not down:
-                    self.held.discard(k.vkCode)
-                    self.send(k=evdev, down=False)
-                return 1
         return user32.CallNextHookEx(None, code, wparam, lparam)
 
+    def to_gnome(self):
+        """The native window (Overlay) has the keyboard: hand it to GNOME first, off this hook, and
+        only then press, since the press reaches GNOME through its focus."""
+        gnome = gnome_window()
+        self.shell.do(lambda: (focus(gnome), time.sleep(FOCUS_SETTLE_S)))
 
-def keyboard_hook_loop(hook):
-    """Run hook(code, wparam, lparam) as a low-level keyboard hook. The hook is called from this thread's
-    message loop, so call it in a thread of its own."""
+    def super_key(self, vk, down):
+        evdev = SUPER_KEYS.get(vk)
+        if not evdev:
+            return False
+        if down and vk not in self.held and gnome_in_front():
+            self.held.add(vk)
+            if user32.GetForegroundWindow() != gnome_window():
+                self.to_gnome()
+            self.shell(k=evdev, down=True)
+            return True
+        if vk in self.held:  # its auto-repeats and release (even if GNOME lost the front since)
+            if not down:
+                self.held.discard(vk)
+                self.shell(k=evdev, down=False)
+            return True
+        return False
+
+    def shortcut(self, vk, down):
+        if vk in self.mods and not down:  # Windows saw the press, so it gets the release too
+            self.mods.discard(vk)
+            self.shell(k=MODIFIERS[vk], down=False)
+            return False
+        evdev = SHORTCUT_KEYS.get(vk)
+        if not evdev:
+            return False
+        if not down:
+            swallowed = vk in self.taps
+            self.taps.discard(vk)
+            return swallowed
+        if not self.mods:
+            held = {m for m in MODIFIERS if user32.GetAsyncKeyState(m) & 0x8000}
+            native = overlay.hwnd and user32.GetForegroundWindow() == overlay.hwnd
+            if not native or 0xA4 not in held or (vk != 0x09 and not held & {0xA2, 0xA3}):
+                return False
+            self.mods = held
+            self.to_gnome()
+            for m in sorted(held):  # Shift, Ctrl, Alt
+                self.shell(k=MODIFIERS[m], down=True)
+        self.taps.add(vk)
+        self.shell(k=evdev, down=True)  # a tap: nothing stays pressed in GNOME if its release goes astray
+        self.shell(k=evdev, down=False)
+        return True
+
+
+def hook_loop(kind, hook):
+    """Run hook(code, wparam, lparam) as a low-level keyboard (13) or mouse (14) hook. The hook is called
+    from this thread's message loop, so call it in a thread of its own."""
     proc = HOOKPROC(hook)
-    if not user32.SetWindowsHookExW(13, proc, kernel32.GetModuleHandleW(None), 0):  # WH_KEYBOARD_LL
-        print("no Super key for GNOME: SetWindowsHookExW failed")
+    if not user32.SetWindowsHookExW(kind, proc, kernel32.GetModuleHandleW(None), 0):
+        print(f"SetWindowsHookExW({kind}) failed:", "no Super key or GNOME shortcuts" if kind == 13 else "title bars of native windows don't move them")
         return
     msg = wt.MSG()
     while user32.GetMessageW(ctypes.byref(msg), None, 0, 0) > 0:
         pass
+
+
+WNDPROC = ctypes.WINFUNCTYPE(ctypes.c_ssize_t, H, wt.UINT, wt.WPARAM, wt.LPARAM)
+
+
+class WNDCLASSW(ctypes.Structure):
+    _fields_ = [("style", wt.UINT), ("lpfnWndProc", WNDPROC), ("cbClsExtra", ctypes.c_int),
+                ("cbWndExtra", ctypes.c_int), ("hInstance", wt.HINSTANCE), ("hIcon", wt.HICON),
+                ("hCursor", wt.HANDLE), ("hbrBackground", wt.HBRUSH), ("lpszMenuName", wt.LPCWSTR),
+                ("lpszClassName", wt.LPCWSTR)]
+
+
+class COPYDATASTRUCT(ctypes.Structure):
+    _fields_ = [("dwData", ctypes.c_size_t), ("cbData", wt.DWORD), ("lpData", ctypes.c_void_p)]
+
+
+class ICONINFO(ctypes.Structure):
+    _fields_ = [("fIcon", wt.BOOL), ("xHotspot", wt.DWORD), ("yHotspot", wt.DWORD), ("hbmMask", wt.HBITMAP),
+                ("hbmColor", wt.HBITMAP)]
+
+
+class BITMAP(ctypes.Structure):
+    _fields_ = [("bmType", wt.LONG), ("bmWidth", wt.LONG), ("bmHeight", wt.LONG), ("bmWidthBytes", wt.LONG),
+                ("bmPlanes", wt.WORD), ("bmBitsPixel", wt.WORD), ("bmBits", ctypes.c_void_p)]
+
+
+user32.RegisterClassW.argtypes = [ctypes.POINTER(WNDCLASSW)]
+user32.RegisterClassW.restype = wt.ATOM
+user32.DefWindowProcW.argtypes = [H, wt.UINT, wt.WPARAM, wt.LPARAM]
+user32.DefWindowProcW.restype = ctypes.c_ssize_t
+user32.ChangeWindowMessageFilterEx.argtypes = [H, wt.UINT, wt.DWORD, ctypes.c_void_p]
+user32.RegisterWindowMessageW.argtypes = [wt.LPCWSTR]
+user32.RegisterWindowMessageW.restype = wt.UINT
+user32.GetIconInfo.argtypes = [wt.HANDLE, ctypes.POINTER(ICONINFO)]
+user32.AllowSetForegroundWindow.argtypes = [wt.DWORD]
+user32.GetCursorPos.argtypes = [ctypes.POINTER(wt.POINT)]
+gdi32.GetObjectW.argtypes = [wt.HANDLE, ctypes.c_int, ctypes.c_void_p]
+gdi32.GetDIBits.argtypes = [wt.HDC, wt.HBITMAP, wt.UINT, wt.UINT, ctypes.c_void_p, ctypes.c_void_p, wt.UINT]
+
+TASKBAR_CREATED = user32.RegisterWindowMessageW("TaskbarCreated")  # "add your icons again", from a new taskbar
+# What Shell_NotifyIcon sends the taskbar (WM_COPYDATA, dwData 1): a signature, the NIM_ message, then
+# NOTIFYICONDATAW with 32-bit handles, the same for 32- and 64-bit apps
+TRAY_DATA = struct.Struct("<II 6I 256s 2I 512s I 128s I 16s I")
+NIF_MESSAGE, NIF_ICON, NIF_TIP, NIF_STATE, NIF_INFO, NIF_GUID = 0x1, 0x2, 0x4, 0x8, 0x10, 0x20
+
+
+def parse_tray(data):
+    """(NIM_ message, the icon's fields) from the data of a tray WM_COPYDATA, or None if it isn't one."""
+    data = bytes(data[:TRAY_DATA.size]).ljust(TRAY_DATA.size, b"\0")  # older apps send less
+    (sig, nim, _, hwnd, uid, flags, callback, hicon, tip, state, state_mask, info, version, info_title, _,
+     guid, _) = TRAY_DATA.unpack(data)
+    if sig != 0x34753423:
+        return None
+
+    def wstr(b):
+        return b.decode("utf-16-le", "replace").split("\0", 1)[0]
+    # a GUID as the registry writes it (NotifyIconSettings' IconGuid)
+    key = f"{{{str(uuid.UUID(bytes_le=guid)).upper()}}}" if flags & NIF_GUID else f"{hwnd}:{uid}"
+    return nim, {"key": key, "hwnd": hwnd, "uid": uid,
+                 "flags": flags, "callback": callback, "hicon": hicon, "tip": wstr(tip), "state": state,
+                 "state_mask": state_mask, "info": wstr(info), "version": version, "info_title": wstr(info_title)}
+
+
+def png(w, h, rgba):
+    """RGBA bytes as a PNG file: GNOME's St.Icon takes encoded images only."""
+    def chunk(kind, data):
+        return struct.pack(">I", len(data)) + kind + data + struct.pack(">I", zlib.crc32(kind + data))
+    rows = b"".join(b"\0" + rgba[y * w * 4:(y + 1) * w * 4] for y in range(h))  # filter 0 on each row
+    return (b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", struct.pack(">IIBBBBB", w, h, 8, 6, 0, 0, 0))
+            + chunk(b"IDAT", zlib.compress(rows)) + chunk(b"IEND", b""))
+
+
+def icon_png(hicon):
+    """An icon as PNG, or None. Right away, while the handle is good: the app may destroy the icon as
+    soon as it has handed it over.
+    ponytail: black-and-white icons (no color bitmap) are skipped; DrawIconEx is the upgrade path."""
+    info = ICONINFO()
+    if not hicon or not user32.GetIconInfo(hicon, ctypes.byref(info)):
+        return None
+    try:
+        bm = BITMAP()
+        if not info.hbmColor or not gdi32.GetObjectW(info.hbmColor, ctypes.sizeof(bm), ctypes.byref(bm)):
+            return None
+        w, h = bm.bmWidth, bm.bmHeight
+        hdc, planes = user32.GetDC(None), []
+        for hbm in (info.hbmColor, info.hbmMask):
+            bmi = BITMAPINFOHEADER(ctypes.sizeof(BITMAPINFOHEADER), w, -h, 1, 32, 0, 0, 0, 0, 0, 0)
+            buf = ctypes.create_string_buffer(w * h * 4)
+            gdi32.GetDIBits(hdc, hbm, 0, h, buf, ctypes.byref(bmi), 0)  # DIB_RGB_COLORS
+            planes.append(np.frombuffer(buf.raw, np.uint8).reshape(h, w, 4))
+        user32.ReleaseDC(None, hdc)
+    finally:
+        gdi32.DeleteObject(info.hbmColor)
+        gdi32.DeleteObject(info.hbmMask)
+    color, mask = planes
+    rgba = color[..., [2, 1, 0, 3]].copy()  # BGRA -> RGBA
+    if not rgba[..., 3].any():  # an icon without alpha: its mask (white) says what's transparent
+        rgba[..., 3] = np.where(mask[..., 0] == 0, 255, 0)
+    return png(w, h, rgba.tobytes())
+
+
+def callback_params(version, uid, event, x, y):
+    """wParam, lParam of a tray icon's callback message as Explorer sends them: for NOTIFYICON_VERSION_4 the
+    point to show a menu at and the event with the icon's id, before that the id and the event."""
+    if version >= 4:
+        return lparam_xy(x, y), ((uid & 0xFFFF) << 16) | event
+    return uid, event
+
+
+def shows_popup(pid):
+    """Process pid has a menu or a popup like it on screen: a visible top-level window that isn't mirrored."""
+    found = []
+
+    def check(h, _):
+        p, r = wt.DWORD(), wt.RECT()
+        user32.GetWindowThreadProcessId(h, ctypes.byref(p))
+        if (p.value == pid and user32.IsWindowVisible(h) and user32.GetWindowRect(h, ctypes.byref(r))
+                and r.right > r.left and r.bottom > r.top and not mirrorable(h)):
+            found.append(h)
+        return not found
+    user32.EnumWindows(ctypes.WINFUNCTYPE(wt.BOOL, H, wt.LPARAM)(check), 0)
+    return bool(found)
+
+
+def give_back_focus(pid):
+    """A click on a tray icon lets its app take the foreground, for its menu. Once the menu is closed without
+    opening a window, the app's hidden window keeps the foreground and keys reach nothing: hand it back to
+    GNOME (or the window shown natively in it). New windows sort themselves out (keep_behind_gnome).
+    ponytail: polls for up to a minute; a WinEvent hook on foreground changes is the upgrade path."""
+    for i in range(240):
+        time.sleep(0.25)
+        gnome, fg = gnome_window(), user32.GetForegroundWindow()
+        if not gnome:
+            return
+        if fg in (gnome, overlay.hwnd):
+            if i >= 8:  # back (or the app never took it)
+                return
+        elif not user32.IsWindowVisible(fg) and not shows_popup(pid):
+            focus(overlay.hwnd or gnome)
+            return
+
+
+def icon_name(icon):
+    """A tray icon's name: its tooltip's first line (the rest is often a status), else its program's."""
+    return icon["tip"].split("\n")[0].strip() or os.path.splitext(icon["exe"])[0]
+
+
+def pinned_icons():
+    """The tray icons Windows shows on its taskbar rather than in its overflow (Settings → Personalization →
+    Taskbar → Other system tray icons): their GUIDs, and (exe name, id) for those without one."""
+    root, found = r"Control Panel\NotifyIconSettings", set()
+    try:
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, root) as k:
+            names = [winreg.EnumKey(k, i) for i in range(winreg.QueryInfoKey(k)[0])]
+    except OSError:
+        return found
+    for name in names:
+        key = rf"{root}\{name}"
+        if hkcu(key, "IsPromoted") == 1:
+            # the path may start with a known folder's GUID ({7C5A40EF-...}\Steam\steam.exe): the name is enough
+            exe = hkcu(key, "ExecutablePath", "").rsplit("\\", 1)[-1].lower()
+            found.add(hkcu(key, "IconGuid", "").upper() or (exe, hkcu(key, "UID")))
+    return found
+
+
+class Tray:
+    """Windows' notification-area icons in GNOME's top bar (the extension draws them): those Windows pins to
+    its taskbar as buttons, the others in a menu, as Windows' overflow.
+
+    Apps hand their icons to the "Shell_TrayWnd" window FindWindow finds first, the top one in z-order: a
+    hidden one of ours in front of Explorer's gets them all, and passes each on to Explorer unchanged, so
+    Windows' own tray stays as it was, also once we're gone. A click on a button in GNOME becomes what
+    Explorer would send the app, which then opens its own menu (right under the button: GNOME covers the
+    whole screen) or a window.
+    ponytail: Shell_NotifyIconGetRect still answers with Explorer's hidden icon, so popups that place
+    themselves next to their icon open at the bottom right; answering with the GNOME button is the upgrade path."""
+
+    def __init__(self, shell):
+        self.shell, self.hwnd, self.conn = shell, None, None
+        self.icons = {}  # key -> {hwnd, exe, uid, callback, version, hidden, png, tip}
+        self.sent = {}  # key -> (png, name, pinned) GNOME shows now
+        self.pinned = set()  # see pinned_icons()
+        self.lock = threading.RLock()  # the window's thread, GNOME's clicks and the main loop
+        self.left = (None, 0.0)  # (key, time) of the last left press, for double clicks
+        self.fronted = 0.0
+        threading.Thread(target=self.loop, daemon=True).start()
+
+    def loop(self):
+        self.proc = WNDPROC(self.wndproc)  # kept for as long as the window lives
+        inst = kernel32.GetModuleHandleW(None)
+        user32.RegisterClassW(ctypes.byref(WNDCLASSW(lpfnWndProc=self.proc, hInstance=inst,
+                                                     lpszClassName="Shell_TrayWnd")))
+        # hidden, but not message-only: FindWindow skips those. WS_EX_TOOLWINDOW | WS_EX_TOPMOST, WS_POPUP
+        self.hwnd = user32.CreateWindowExW(0x88, "Shell_TrayWnd", None, 0x80000000, 0, 0, 0, 0, None, None, inst, None)
+        user32.ChangeWindowMessageFilterEx(self.hwnd, 0x4A, 1, None)  # WM_COPYDATA from lower integrity too, as Explorer
+        self.to_front()
+        msg = wt.MSG()
+        while user32.GetMessageW(ctypes.byref(msg), None, 0, 0) > 0:
+            user32.DispatchMessageW(ctypes.byref(msg))
+
+    def to_front(self):
+        """In front of Explorer's tray window, then every app adds its icons again, as for a new taskbar: to us.
+        ponytail: what changed while Explorer's was in front reaches us only this way, at most every 5 s, and
+        an app that ignores TaskbarCreated shows up with its next change."""
+        self.fronted = time.monotonic()
+        user32.SetWindowPos(self.hwnd, H(-1), 0, 0, 0, 0, 0x1 | 0x2 | 0x10)  # HWND_TOPMOST, NOSIZE | NOMOVE | NOACTIVATE
+        if user32.FindWindowExW(None, None, "Shell_TrayWnd", None) == self.hwnd:
+            user32.PostMessageW(H(0xFFFF), TASKBAR_CREATED, 0, 0)  # HWND_BROADCAST
+
+    def wndproc(self, hwnd, msg, wparam, lparam):
+        if msg != 0x4A:  # WM_COPYDATA; the rest is the window's own, not Explorer's business (WM_DESTROY...)
+            return user32.DefWindowProcW(hwnd, msg, wparam, lparam)
+        # Explorer's by name: another Shell_TrayWnd (a second winbridge.py) would pass it back to us
+        explorer, res = None, ctypes.c_ssize_t(0)
+        while (explorer := user32.FindWindowExW(None, explorer, "Shell_TrayWnd", None)) and process_name(explorer) != "explorer.exe":
+            pass
+        if explorer:
+            user32.SendMessageTimeoutW(explorer, 0x4A, wparam, lparam, 0x2, 1000, ctypes.byref(res))  # SMTO_ABORTIFHUNG
+        cds = COPYDATASTRUCT.from_address(lparam)
+        parsed = cds.dwData == 1 and cds.lpData and parse_tray(ctypes.string_at(cds.lpData, cds.cbData))
+        if not parsed:  # app bars, icon positions: Explorer answers
+            return res.value
+        self.update(*parsed)
+        return 1
+
+    def update(self, nim, n):
+        key = n["key"]
+        with self.lock:
+            if nim == 2:  # NIM_DELETE
+                self.icons.pop(key, None)
+            elif nim == 4:  # NIM_SETVERSION
+                if key in self.icons:
+                    self.icons[key]["version"] = n["version"]
+            elif nim in (0, 1):  # NIM_ADD, NIM_MODIFY (also of one added before we were here)
+                icon = self.icons.setdefault(key, {"hwnd": 0, "exe": "", "uid": 0, "callback": 0, "version": 0,
+                                                   "hidden": False, "png": None, "tip": ""})
+                if n["hwnd"] and n["hwnd"] != icon["hwnd"]:
+                    icon["hwnd"], icon["uid"] = n["hwnd"], n["uid"]
+                    icon["exe"] = os.path.basename(process_info(n["hwnd"])[0])
+                if n["flags"] & NIF_MESSAGE:
+                    icon["callback"] = n["callback"]
+                if n["flags"] & NIF_ICON:
+                    icon["png"] = icon_png(n["hicon"])
+                if n["flags"] & NIF_TIP:
+                    icon["tip"] = n["tip"]
+                if n["flags"] & NIF_STATE and n["state_mask"] & 1:  # NIS_HIDDEN
+                    icon["hidden"] = bool(n["state"] & 1)
+                if n["flags"] & NIF_INFO and n["info"]:  # a balloon
+                    self.shell(tray=key, title=n["info_title"] or icon_name(icon), text=n["info"])
+            self.publish(key)
+
+    def publish(self, key):
+        """Tell GNOME about this icon if that changed: its picture, name and whether Windows pins it to the
+        taskbar, or that it's gone. Not Explorer's own (battery, volume, network): GNOME shows those itself."""
+        icon = self.icons.get(key)
+        now = None
+        if icon and icon["png"] and not icon["hidden"] and icon["exe"] != "explorer.exe":
+            now = (icon["png"], icon_name(icon), key in self.pinned or (icon["exe"], icon["uid"]) in self.pinned)
+        if now == self.sent.get(key):
+            return
+        if now:
+            self.sent[key] = now
+            self.shell(tray=key, icon=base64.b64encode(now[0]).decode(), tip=now[1], pinned=now[2])
+        else:
+            del self.sent[key]
+            self.shell(tray=key)
+
+    def tick(self):
+        """From the main loop: stay in front of Explorer's tray window, drop the icons of apps that died, follow
+        what Windows pins, and show them all to a GNOME that (re)connected."""
+        if not self.hwnd:
+            return
+        if (user32.FindWindowExW(None, None, "Shell_TrayWnd", None) != self.hwnd
+                and time.monotonic() - self.fronted > 5):
+            print("tray: another tray window came to the front, back in front of it")
+            self.to_front()
+        pinned = pinned_icons()
+        with self.lock:
+            self.pinned = pinned
+            if self.shell.sock is not self.conn:
+                self.conn, self.sent = self.shell.sock, {}
+            for key, icon in list(self.icons.items()):
+                if not user32.IsWindow(icon["hwnd"]):
+                    del self.icons[key]
+            for key in self.icons.keys() | self.sent.keys():
+                self.publish(key)
+
+    def click(self, m):
+        """A press or release on an icon's button in GNOME: what Explorer's tray would send its app."""
+        key, b, down = m["tray"], m["b"], m["down"]
+        with self.lock:
+            icon = dict(self.icons.get(key) or {})
+        if not icon.get("callback") or b not in (1, 2, 3):
+            return
+        if down:
+            events = [{1: 0x201, 2: 0x207, 3: 0x204}[b]]  # WM_LBUTTONDOWN, WM_MBUTTONDOWN, WM_RBUTTONDOWN
+            if b == 1:
+                last, self.left = self.left, (key, time.monotonic())
+                if last[0] == key and self.left[1] - last[1] < user32.GetDoubleClickTime() / 1000:
+                    events, self.left = [0x203], (None, 0.0)  # WM_LBUTTONDBLCLK
+        else:
+            # the app opens its menu or a window now, which takes the foreground: lift Windows' lock on it
+            # (focus()'s Alt tap) and hand the app the right
+            pid = wt.DWORD()
+            user32.GetWindowThreadProcessId(icon["hwnd"], ctypes.byref(pid))
+            user32.keybd_event(0x12, 0, 0, 0)
+            user32.keybd_event(0x12, 0, 2, 0)
+            user32.AllowSetForegroundWindow(pid.value)
+            # WM_xBUTTONUP, from version 3 on followed by NIN_SELECT / WM_CONTEXTMENU, where most apps act
+            events = {1: [0x202, 0x400], 2: [0x208], 3: [0x205, 0x7B]}[b][:None if icon["version"] >= 3 else 1]
+            threading.Thread(target=give_back_focus, args=(pid.value,), daemon=True).start()
+        pt = wt.POINT()
+        user32.GetCursorPos(ctypes.byref(pt))  # on the button: GNOME covers the whole screen
+        for event in events:
+            user32.PostMessageW(icon["hwnd"], icon["callback"],
+                                *callback_params(icon["version"], icon["uid"], event, pt.x, pt.y))
 
 
 def message(kind, payload):
@@ -734,7 +1302,9 @@ def changed_rects(cur, prev):
     return rects
 
 
-COMPRESS_BELOW = 1 << 20  # bytes of changed pixels
+# bytes of changed pixels. zlib runs ~150 MB/s, the socket ~700 MB/s: compressing a 1 MB patch cost
+# ~7 ms on each end against ~1.5 ms to send it raw. ponytail: latency knob, raise it if bandwidth bites
+COMPRESS_BELOW = 1 << 16
 
 
 def frame_patch(cur, prev):
@@ -764,9 +1334,9 @@ def frame_patch(cur, prev):
 # Capture interval for every window. A lower rate for unfocused ones cost more than it saved: switching
 # meant restarting WGC, ~150 ms without frames on every focus change, and scrolling a window under
 # the pointer without focusing it ran at that low rate. WGC counts the interval from when the last
-# frame was handled and frames come on vsync, so 33 ms gave ~18 fps: 16 lets a frame through on
-# the first vsync after its handling.
-FRAME_MS = 16
+# frame was handled and frames come on vsync, so 33 ms gave ~18 fps: 8 lets a frame through on
+# the first vsync after its handling, at 120 Hz too.
+FRAME_MS = 8
 
 
 def pixels_of(frame):
@@ -816,20 +1386,18 @@ class Session(threading.Thread):
 
     def run(self):
         hwnd = self.hwnd
-        if user32.IsIconic(hwnd):
-            user32.ShowWindow(hwnd, 4)  # SW_SHOWNOACTIVATE: minimized windows capture as black
-        keep_behind_gnome(hwnd)
-        title = text(user32.GetWindowTextW, hwnd)
-        w, h = client_size(hwnd)
-        global last_connected
         try:
             sock = socket.create_connection(("localhost", self.port))
         except OSError:
-            return
-        last_connected = time.monotonic()
+            return  # retried every half second while GNOME is (re)starting: touch nothing before this
+        # Nagle held back small input replies and each frame's last segment until an ACK (tens of ms)
+        sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        keep_behind_gnome(hwnd)
+        title = text(user32.GetWindowTextW, hwnd)
+        w, h = client_size(hwnd)
         app = app_for(hwnd, title)
         own_titlebar = draws_own_titlebar(hwnd)
-        hello = {"title": title, "w": w, "h": h, "app": app, "own_titlebar": own_titlebar}
+        hello = {"title": title, "w": w, "h": h, "app": app, "own_titlebar": own_titlebar, "hwnd": hwnd}
         sock.sendall((json.dumps(hello) + "\n").encode())
         print(f"+ {title}  [{app or 'no app match'}]{'  (own title bar)' if own_titlebar else ''}")
         lock = threading.Lock()  # frames (this thread) and hit replies (reader thread) share the socket
@@ -853,6 +1421,8 @@ class Session(threading.Thread):
                 if new_title != title:
                     title = new_title
                     send(message(b"TITL", title.encode()))
+                if hwnd == overlay.want.get("o") and hwnd != overlay.hwnd:
+                    overlay.update()  # e.g. no longer minimized, or resized by the app: may fit now
                 if wgc:
                     # frames arrive by themselves; check the title twice a second
                     self.wake.wait(0.5)
@@ -880,6 +1450,7 @@ class Session(threading.Thread):
             self.outbox.put_nowait(None)  # sender idle: let it end (a busy one fails on the closed socket)
         except queue.Full:
             pass
+        overlay.areas.pop(hwnd, None)
         print(f"- {title}")
 
     def read_events(self, sock, inp):
@@ -893,33 +1464,44 @@ class Session(threading.Thread):
             pass
 
 
-last_connected = time.monotonic()
-
-
 def main():
     port = int(sys.argv[1]) if len(sys.argv) > 1 else 47800
     sessions = {}
+    # the log is cp1252 when redirected: a window title with U+200E crashed its session on every retry
+    sys.stdout.reconfigure(errors="replace")
     no_power_throttling()
+    # Windows waits for the low-level hooks on every key and mouse event, and they need the GIL that
+    # the capture threads hold: hand it over within 1 ms, not the default 5
+    sys.setswitchinterval(0.001)
     print(f"mirroring app windows -> localhost:{port}")
-    shell = GnomeShell(port + 1)
-    swipes = Swipes(lambda phase, fingers, dx, dy: shell(p=phase, n=fingers, dx=dx, dy=dy))
+    shell = GnomeShell(port + 1, lambda m: tray.click(m) if "tray" in m else overlay.update(m))
+    tray = Tray(shell)
+    swipes =Swipes(lambda phase, fingers, dx, dy: shell(p=phase, n=fingers, dx=dx, dy=dy))
     threading.Thread(target=touchpad_loop, args=(swipes.frame,), daemon=True).start()
-    threading.Thread(target=keyboard_hook_loop, args=(SuperKey(shell).hook,), daemon=True).start()
+    threading.Thread(target=hook_loop, args=(13, GnomeKeys(shell).hook), daemon=True).start()  # WH_KEYBOARD_LL
+    threading.Thread(target=hook_loop, args=(14, overlay.mouse_hook), daemon=True).start()  # WH_MOUSE_LL
+    gnome_seen, last_look = time.monotonic(), None
     while True:
+        if gnome_window():
+            gnome_seen = time.monotonic()
+        elif time.monotonic() - gnome_seen > 10:  # (not up yet at start, or) closed
+            print("GNOME is gone, exiting")
+            return
         wanted = launched_from_gnome()
         if wanted:
             uncloak_launched(wanted)
         current = set(app_windows())
-        # windows to mirror, yet none could connect for 10 s: GNOME was closed
-        if current and not any(s.is_alive() for s in sessions.values()) and time.monotonic() - last_connected > 10:
-            print("GNOME is gone, exiting")
-            return
         for hwnd in current - sessions.keys():
             sessions[hwnd] = Session(hwnd, port)
             sessions[hwnd].start()
         for hwnd in list(sessions):
             if hwnd not in current or not sessions[hwnd].is_alive():
                 sessions.pop(hwnd).stopped.set()
+        look = (appearance(), shell.sock)  # the socket too: sent again after GNOME (re)connects
+        if look != last_look and shell.sock:
+            shell(**look[0])
+            last_look = look
+        tray.tick()
         time.sleep(0.5)
 
 

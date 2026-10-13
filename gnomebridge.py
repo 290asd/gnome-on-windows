@@ -32,13 +32,21 @@ VK = {"Return": 0x0D, "KP_Enter": 0x0D, "BackSpace": 0x08, "Tab": 0x09, "Escape"
 # dash). GTK3 only sets one app_id per process and has no Python binding for this, hence ctypes.
 _gdk = ctypes.CDLL("libgdk-3.so.0")
 _gdk.gdk_wayland_window_set_application_id.argtypes = [ctypes.c_void_p, ctypes.c_char_p]
+_gdk.gdk_wayland_window_set_dbus_properties_libgtk_only.argtypes = [ctypes.c_void_p] + [ctypes.c_char_p] * 6
 ctypes.pythonapi.PyCapsule_GetPointer.restype = ctypes.c_void_p
 ctypes.pythonapi.PyCapsule_GetPointer.argtypes = [ctypes.py_object, ctypes.c_char_p]
 
 
-def set_app_id(widget, app_id):
+def tag_window(widget, app_id, hwnd):
     ptr = ctypes.pythonapi.PyCapsule_GetPointer(widget.get_window().__gpointer__, None)
-    _gdk.gdk_wayland_window_set_application_id(ptr, app_id.encode())
+    if app_id:
+        _gdk.gdk_wayland_window_set_application_id(ptr, app_id.encode())
+    # The Windows handle, as GTK's D-Bus window path: the windows-touchpad extension reads it to tell
+    # winbridge.py where this mirror is, so it can show the real window there (its Overlay). GNOME Shell
+    # then looks for window actions at that path on the given bus name, and crashes if there is none:
+    # the bus itself always answers (that it has none)
+    _gdk.gdk_wayland_window_set_dbus_properties_libgtk_only(
+        ptr, app_id.encode() or None, None, None, f"/hwnd/{hwnd}".encode(), None, b"org.freedesktop.DBus")
 
 
 def apply_rects(buf, w, rects, pixels):
@@ -55,6 +63,9 @@ def apply_rects(buf, w, rects, pixels):
             buf[p:p + seg] = pixels[off:off + seg]
             off += seg
 
+
+NO_HEIGHT = Gtk.CssProvider()
+NO_HEIGHT.load_from_data(b"* { min-height: 0; }")  # Adwaita gives title bars 46 px at least
 
 # WM_NCHITTEST resize edges -> GDK edges
 EDGES = {10: Gdk.WindowEdge.WEST, 11: Gdk.WindowEdge.EAST, 12: Gdk.WindowEdge.NORTH,
@@ -77,12 +88,16 @@ class Mirror(Gtk.Window):
         super().__init__(title=hello["title"])
         self.conn = conn
         self.frame = None
-        self.last_move = 0.0
         self.pending_resize = None
+        self.area_size = None  # last size sent as an "area" event
         self.press = None  # last left press, used when Windows answers that it hit the app's title bar
         self.caption_at = 0.0
         if hello.get("own_titlebar"):
-            self.set_decorated(False)  # the app's own top edge acts as the title bar (see on_hit)
+            # The app's own top edge acts as the title bar (see on_hit). An empty, zero-height title bar
+            # rather than no decorations: GTK's resize borders (and shadow) stay around the window.
+            bar = Gtk.Box()
+            bar.get_style_context().add_provider(NO_HEIGHT, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
+            self.set_titlebar(bar)
 
         area = Gtk.DrawingArea(can_focus=True)
         area.add_events(Gdk.EventMask.BUTTON_PRESS_MASK | Gdk.EventMask.BUTTON_RELEASE_MASK
@@ -100,9 +115,8 @@ class Mirror(Gtk.Window):
         # one Windows pixel per screen pixel: sharp, at the cost of not matching Windows' 175 % size
         s = self.get_scale_factor()
         self.set_default_size(max(hello["w"] // s, 50), max(hello["h"] // s, 50))
-        if hello.get("app"):
-            # after map: the Wayland toplevel only exists once the window is shown
-            self.connect_after("map", lambda w: set_app_id(w, hello["app"]))
+        # after map: the Wayland toplevel only exists once the window is shown
+        self.connect_after("map", lambda w: tag_window(w, hello.get("app", ""), hello.get("hwnd", 0)))
         self.connect("delete-event", self.on_close)
         self.connect("focus-in-event", lambda *_: self.send(t="focus", on=True))
         self.connect("focus-out-event", lambda *_: self.send(t="focus", on=False))
@@ -130,7 +144,8 @@ class Mirror(Gtk.Window):
                     pixels = payload[12 + 16 * n:]
                     if kind == b"PTCH":
                         pixels = zlib.decompress(pixels)
-                    GLib.idle_add(self.apply_patch, w, h, rects, pixels)
+                    # ahead of GTK's redraw (HIGH_IDLE + 20): the default idle priority missed a frame
+                    GLib.idle_add(self.apply_patch, w, h, rects, pixels, priority=GLib.PRIORITY_HIGH_IDLE)
                 elif kind == b"TITL":
                     GLib.idle_add(self.set_title, payload.decode())
                 elif kind == b"HITT":
@@ -196,10 +211,7 @@ class Mirror(Gtk.Window):
             self.begin_resize_drag(EDGES[hit], button, x, y, stamp)
 
     def on_motion(self, widget, e):
-        now = time.monotonic()
-        if now - self.last_move >= 0.015:  # ~60 Hz is plenty
-            self.last_move = now
-            self.send(t="move", x=self.px(e.x), y=self.px(e.y))
+        self.send(t="move", x=self.px(e.x), y=self.px(e.y))  # GTK already merges motion per frame
 
     def on_scroll(self, widget, e):
         ok, dx, dy = e.get_scroll_deltas()
@@ -220,6 +232,10 @@ class Mirror(Gtk.Window):
         return False
 
     def on_size(self, widget, alloc):
+        size = (self.px(alloc.width), self.px(alloc.height))
+        if size != self.area_size:  # where winbridge.py's Overlay lays the real window
+            self.area_size = size
+            self.send(t="area", w=size[0], h=size[1])
         # debounce: resize the real window once the user stops dragging
         if self.pending_resize:
             GLib.source_remove(self.pending_resize)
@@ -237,6 +253,7 @@ def serve(port):
     print(f"waiting for winbridge.py on port {port} ...")
     while True:
         conn, _ = srv.accept()
+        conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)  # input events go out at once
         hello = b""
         try:
             while not hello.endswith(b"\n"):

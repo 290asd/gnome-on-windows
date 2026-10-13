@@ -8,7 +8,8 @@ $ErrorActionPreference = "Stop"
 $share = Join-Path $PSScriptRoot "share"
 $appsDir = Join-Path $share "applications"
 $iconDir = Join-Path $share "icons\windows"
-$wslDir = wsl -d Ubuntu-24.04 --exec wslpath -a $PSScriptRoot
+$distro = if ($env:GNOME_DISTRO) { $env:GNOME_DISTRO } else { "Ubuntu-24.04" }
+$wslDir = wsl -d $distro --exec wslpath -a $PSScriptRoot
 $launcher = "$wslDir/win-launch.sh"
 $linuxIcons = "$wslDir/share/icons/windows"
 

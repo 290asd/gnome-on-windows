@@ -9,7 +9,8 @@ function WinTimes {
     $t
 }
 $before = WinTimes
-$linux = wsl -d Ubuntu-24.04 --exec bash "$(wsl -d Ubuntu-24.04 --exec wslpath -a $PSScriptRoot)/perf.sh" $Seconds   # takes $Seconds
+$distro = if ($env:GNOME_DISTRO) { $env:GNOME_DISTRO } else { "Ubuntu-24.04" }
+$linux = wsl -d $distro --exec bash "$(wsl -d $distro --exec wslpath -a $PSScriptRoot)/perf.sh" $Seconds   # takes $Seconds
 $after = WinTimes
 foreach ($k in $after.Keys) { "{0,-28} {1,5:N0} %" -f $k, (($after[$k] - $before[$k]) * 100 / $Seconds) }
 $linux

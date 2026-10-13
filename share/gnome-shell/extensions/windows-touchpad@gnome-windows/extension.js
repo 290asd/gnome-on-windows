@@ -81,9 +81,14 @@ export default class WindowsTouchpad {
             global.display.connect('grab-op-end', () => (this._grabbed = false)),
         ];
         this._frameId = global.stage.connect('before-update', () => this._reportOverlay());
+        // From 49 on, GNOME's window is a screen cast to mutter-devkit: GNOME shows it as screen sharing, with a
+        // stop button that would end it. ponytail: hides Linux apps' own screen sharing too; tell the handles
+        // apart if that ever matters.
+        Main.panel.statusArea.screenSharing?.container.hide();
     }
 
     disable() {
+        Main.panel.statusArea.screenSharing?.container.show();
         global.stage.disconnect(this._frameId);
         this._grabIds.forEach(id => global.display.disconnect(id));
         if (this._warmUp)

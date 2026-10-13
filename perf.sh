@@ -1,7 +1,7 @@
 #!/bin/bash
 # CPU use of the Linux side over N seconds (default 10), in % of one core.
 secs=${1:-10}
-pids="$(pgrep -x gnome-shell) $(pgrep -x mutter-devkit) $(pgrep -f '^python3 -u .*gnomebridge')"
+pids="$(pgrep -x gnome-shell) $(pgrep -x gnome-viewer) $(pgrep -f '^python3 -u .*gnomebridge')"
 ticks() { for p in $pids; do echo "$p $(awk '{print $14 + $15}' /proc/$p/stat 2>/dev/null)"; done; }
 before=$(ticks)
 sleep "$secs"

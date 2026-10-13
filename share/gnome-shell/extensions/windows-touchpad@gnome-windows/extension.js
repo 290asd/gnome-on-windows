@@ -42,7 +42,7 @@ export default class WindowsTouchpad {
     enable() {
         // GNOME 46's nested mutter turns these into XTest key presses on the WSLg X server, which sends them
         // back to GNOME's window: there they combine with the other keys, which arrive through RDP. From 49 on
-        // (devkit) they go straight into mutter's own seat, next to the viewer's keys.
+        // (headless) they go straight into mutter's own seat, next to the viewer's keys.
         // Clutter.get_default_backend() is gone in GNOME 51
         const backend = global.stage.context?.get_backend() ?? Clutter.get_default_backend();
         this._keyboard = backend.get_default_seat()
@@ -81,7 +81,7 @@ export default class WindowsTouchpad {
             global.display.connect('grab-op-end', () => (this._grabbed = false)),
         ];
         this._frameId = global.stage.connect('before-update', () => this._reportOverlay());
-        // From 49 on, GNOME's window is a screen cast to mutter-devkit: GNOME shows it as screen sharing, with a
+        // From 49 on, GNOME's window is a screen cast to gnome-viewer: GNOME shows it as screen sharing, with a
         // stop button that would end it. ponytail: hides Linux apps' own screen sharing too; tell the handles
         // apart if that ever matters.
         Main.panel.statusArea.screenSharing?.container.hide();

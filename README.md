@@ -1,6 +1,7 @@
 # GNOME on Windows
 
-Real GNOME Shell (Ubuntu 24.04 in WSL2/WSLg) running fullscreen on Windows 11, with your Windows apps
+Real GNOME Shell (GNOME 46 on Ubuntu 24.04, or GNOME 49 and later such as Ubuntu 26.04, in WSL2/WSLg)
+running fullscreen on Windows 11, with your Windows apps
 inside it as ordinary GNOME windows: in the dash and app grid with their own icons, on any workspace,
 moved, tiled and closed by GNOME, while the apps themselves keep running on Windows.
 
@@ -27,9 +28,14 @@ moved, tiled and closed by GNOME, while the apps themselves keep running on Wind
 
 ## Requirements
 
-- Windows 11 with WSL2 and WSLg, and a distro named `Ubuntu-24.04`:
+- Windows 11 with WSL2 and WSLg, and an Ubuntu distro, `Ubuntu-24.04` (GNOME 46) unless `GNOME_DISTRO`
+  names another:
   ```
   sudo apt install gnome-shell python3-gi python3-gi-cairo gir1.2-gtk-3.0 wmctrl x11-utils x11-xserver-utils
+  ```
+  GNOME 49 and later (Ubuntu 26.04 and newer) also need PipeWire and what `gnome-viewer.c` is built with:
+  ```
+  sudo apt install pipewire wireplumber gcc pkg-config libpipewire-0.3-dev libglib2.0-dev libxcb1-dev libxcb-shm0-dev libxcb-render0-dev libxcb-render-util0-dev libxcb-xkb-dev
   ```
 - Python 3 on Windows (the `py` launcher), with:
   ```
@@ -63,13 +69,16 @@ moved, tiled and closed by GNOME, while the apps themselves keep running on Wind
    ```
    powershell -ExecutionPolicy Bypass -File start-gnome.ps1
    ```
+   For a distro other than `Ubuntu-24.04`, set `GNOME_DISTRO` first (PowerShell: `$env:GNOME_DISTRO = "Ubuntu-26.04"`,
+   or once for good with `setx GNOME_DISTRO Ubuntu-26.04`). Stop the other one first: they share ports.
    Stop with `start-gnome.ps1 stop`, or the *Exit GNOME* launcher inside GNOME.
 
 ## How it works
 
 | Piece | Side | Job |
 |---|---|---|
-| `gnome-nested.sh` | WSL | Nested GNOME Shell in one fullscreen WSLg window (software rendering) |
+| `gnome-nested.sh` | WSL | GNOME Shell in one fullscreen WSLg window, on the NVIDIA GPU through d3d12 if there is one: nested mutter up to GNOME 48, headless GNOME and gnome-viewer from 49 on |
+| `gnome-viewer.c` | WSL | GNOME 49+: the window GNOME shows in (built on first start): GNOME's frames over PipeWire straight to WSLg's X server, mouse and keyboard back through mutter's RemoteDesktop API |
 | `winbridge.py` | Windows | Captures each app window (Windows.Graphics.Capture) and streams the changed pixels; posts mouse and keyboard input back; reads touchpad swipes and the Windows key; lays the focused window natively over its mirror; reports the wallpaper and dark mode; takes the apps' tray icons in front of Explorer (passing each on to it) and clicks them |
 | `gnomebridge.py` | WSL | One GTK window per Windows window: draws the frames, sends input back |
 | `share/gnome-shell/extensions/windows-touchpad@gnome-windows` | GNOME | Feeds the swipes to GNOME's own gesture handling and presses Super; tells winbridge.py where the focused mirror is while nothing of GNOME's covers it; sets Windows' wallpaper and dark mode; shows the tray icons and their balloons |
@@ -88,7 +97,9 @@ moved, tiled and closed by GNOME, while the apps themselves keep running on Wind
 - GNOME notification banners can end up under the native window.
 - Two mirrors side by side in GNOME can cover each other on the Windows side; then only the focused
   one keeps updating.
-- Assumes the distro name `Ubuntu-24.04`, Linux user id 1000 and GNOME Shell 46.
+- Assumes Linux user id 1000 and GNOME Shell 46 or 49 and later.
+- GNOME 49+: wheel scrolling only in steps (no smooth touchpad scrolling inside GNOME's own UI), and no
+  clipboard between Windows and GNOME's own Linux apps.
 - Wi-Fi: GNOME joins personal (password) and open networks, and any network Windows has saved;
   an enterprise (802.1X) network has to be joined once in Windows' own settings. A saved network's
   settings can't be edited from GNOME (only connected, disconnected, forgotten). No wired, VPN or

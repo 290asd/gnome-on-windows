@@ -53,6 +53,10 @@ user32.GetClientRect.argtypes = [H, ctypes.POINTER(wt.RECT)]
 user32.GetWindowRect.argtypes = [H, ctypes.POINTER(wt.RECT)]
 user32.ChildWindowFromPointEx.argtypes = [H, wt.POINT, wt.UINT]
 user32.ChildWindowFromPointEx.restype = H
+user32.WindowFromPoint.argtypes = [wt.POINT]
+user32.WindowFromPoint.restype = H
+user32.GetAncestor.argtypes = [H, wt.UINT]
+user32.GetAncestor.restype = H
 user32.MapWindowPoints.argtypes = [H, H, ctypes.POINTER(wt.POINT), wt.UINT]
 user32.ClientToScreen.argtypes = [H, ctypes.POINTER(wt.POINT)]
 user32.GetWindowTextW.argtypes = [H, wt.LPWSTR, ctypes.c_int]
@@ -758,12 +762,13 @@ class Swipes:
 
 
 class GnomeShell:
-    """JSON lines with the GNOME Shell extension windows-touchpad@gnome-windows: swipes, the Super key and
-    tray icons out, where the focused mirror is and tray clicks (for on_line) in. Out goes through a thread
+    """JSON lines with the GNOME Shell extension windows-touchpad@gnome-windows: swipes, scrolling, the Super key
+    and tray icons out, where the focused mirror is, tray clicks and whether it scrolls smoothly (for on_line) in. Out goes through a thread
     of its own: the keyboard hook has to return at once, or every key press on Windows waits."""
 
     def __init__(self, port, on_line):
         self.port, self.on_line, self.out, self.sock = port, on_line, queue.Queue(), None
+        self.smooth = False  # the extension scrolls smoothly (GNOME 49+), see GnomeWheel
         threading.Thread(target=self.send_loop, daemon=True).start()
         threading.Thread(target=self.read_loop, daemon=True).start()
 
@@ -802,7 +807,7 @@ class GnomeShell:
                     self.on_line(json.loads(line))
             except (OSError, ValueError):
                 pass
-            self.sock = None
+            self.sock, self.smooth = None, False
             sock.close()
             self.on_line({"o": 0})  # GNOME is gone: nothing to show natively
             time.sleep(1)
@@ -942,12 +947,32 @@ class GnomeKeys:
         return True
 
 
+class GnomeWheel:
+    """Wheel and touchpad scrolling over GNOME's own window (not over the native one), taken from Windows by
+    the low-level mouse hook and scrolled in GNOME by the extension, in the fractions of a step a precision
+    touchpad gives: WSLg rounds them to whole steps for its X server, or drops them. Only while the extension
+    says it can (GNOME 49+; GNOME 46's nested mutter can't scroll from it), else WSLg's steps as before."""
+
+    def __init__(self, shell):
+        self.shell = shell
+
+    def hook(self, code, wparam, lparam):
+        if code == 0 and wparam in (0x20A, 0x20E) and self.shell.smooth:  # WM_MOUSEWHEEL, WM_MOUSEHWHEEL
+            m = MSLLHOOKSTRUCT.from_address(lparam)
+            gnome = gnome_window()
+            if gnome and user32.GetAncestor(user32.WindowFromPoint(m.pt), 2) == gnome:  # GA_ROOT
+                steps = ctypes.c_short(m.mouseData >> 16).value / 120  # WHEEL_DELTA a step, up and right > 0
+                self.shell(s=[steps, 0] if wparam == 0x20E else [0, -steps])  # GNOME: right and down > 0
+                return 1
+        return overlay.mouse_hook(code, wparam, lparam)
+
+
 def hook_loop(kind, hook):
     """Run hook(code, wparam, lparam) as a low-level keyboard (13) or mouse (14) hook. The hook is called
     from this thread's message loop, so call it in a thread of its own."""
     proc = HOOKPROC(hook)
     if not user32.SetWindowsHookExW(kind, proc, kernel32.GetModuleHandleW(None), 0):
-        print(f"SetWindowsHookExW({kind}) failed:", "no Super key or GNOME shortcuts" if kind == 13 else "title bars of native windows don't move them")
+        print(f"SetWindowsHookExW({kind}) failed:", "no Super key or GNOME shortcuts" if kind == 13 else "title bars of native windows don't move them, no smooth scrolling")
         return
     msg = wt.MSG()
     while user32.GetMessageW(ctypes.byref(msg), None, 0, 0) > 0:
@@ -1474,12 +1499,20 @@ def main():
     # the capture threads hold: hand it over within 1 ms, not the default 5
     sys.setswitchinterval(0.001)
     print(f"mirroring app windows -> localhost:{port}")
-    shell = GnomeShell(port + 1, lambda m: tray.click(m) if "tray" in m else overlay.update(m))
+    def from_gnome(m):
+        if "tray" in m:
+            tray.click(m)
+        elif "smooth" in m:
+            shell.smooth = m["smooth"]
+        else:
+            overlay.update(m)
+
+    shell = GnomeShell(port + 1, from_gnome)
     tray = Tray(shell)
     swipes =Swipes(lambda phase, fingers, dx, dy: shell(p=phase, n=fingers, dx=dx, dy=dy))
     threading.Thread(target=touchpad_loop, args=(swipes.frame,), daemon=True).start()
     threading.Thread(target=hook_loop, args=(13, GnomeKeys(shell).hook), daemon=True).start()  # WH_KEYBOARD_LL
-    threading.Thread(target=hook_loop, args=(14, overlay.mouse_hook), daemon=True).start()  # WH_MOUSE_LL
+    threading.Thread(target=hook_loop, args=(14, GnomeWheel(shell).hook), daemon=True).start()  # WH_MOUSE_LL
     gnome_seen, last_look = time.monotonic(), None
     while True:
         if gnome_window():

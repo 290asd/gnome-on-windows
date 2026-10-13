@@ -5,10 +5,12 @@
 // winbridge.py where the focused mirror is, so it can show the real Windows window there.
 // And sets Windows' dark mode and desktop wallpaper in GNOME, following them when they change.
 // And shows Windows' notification-area (tray) icons in the top bar, their clicks going back to the apps.
+// And scrolls smoothly (GNOME 49+) by the wheel and touchpad scrolling winbridge.py takes over GNOME's window.
 import Clutter from 'gi://Clutter';
 import Gio from 'gi://Gio';
 import GLib from 'gi://GLib';
 import St from 'gi://St';
+import * as Config from 'resource:///org/gnome/shell/misc/config.js';
 import * as Main from 'resource:///org/gnome/shell/ui/main.js';
 import * as PanelMenu from 'resource:///org/gnome/shell/ui/panelMenu.js';
 import * as PopupMenu from 'resource:///org/gnome/shell/ui/popupMenu.js';
@@ -47,6 +49,12 @@ export default class WindowsTouchpad {
         const backend = global.stage.context?.get_backend() ?? Clutter.get_default_backend();
         this._keyboard = backend.get_default_seat()
             .create_virtual_device(Clutter.InputDeviceType.KEYBOARD_DEVICE);
+        // Smooth scrolling for winbridge.py, which then keeps the wheel and touchpad scrolling over GNOME's window
+        // from WSLg (that rounds them to whole steps). Not on GNOME 46: nested mutter can't scroll from it.
+        if (parseInt(Config.PACKAGE_VERSION) >= 49) {
+            this._pointer = backend.get_default_seat()
+                .create_virtual_device(Clutter.InputDeviceType.POINTER_DEVICE);
+        }
         // the first such key press after mutter starts is lost: spend it on a lone Shift
         this._warmUp = GLib.timeout_add(GLib.PRIORITY_DEFAULT, 3000, () => {
             for (const state of [Clutter.KeyState.PRESSED, Clutter.KeyState.RELEASED])
@@ -68,6 +76,8 @@ export default class WindowsTouchpad {
         this._service.connect('incoming', (service, connection) => {
             this._connections.add(connection);
             this._readLine(new Gio.DataInputStream({base_stream: connection.get_input_stream()}), connection);
+            if (this._pointer)
+                this._write(connection, '{"smooth": true}\n');
             if (this._overlay)
                 this._write(connection, this._overlay);
             return true;
@@ -101,7 +111,7 @@ export default class WindowsTouchpad {
         this._trayIcons.forEach((t, id) => this._dropTrayIcon(id));
         this._trayMenu.destroy();
         this._trayIcons = this._trayMenu = null;
-        this._keyboard = null;
+        this._keyboard = this._pointer = null;
     }
 
     _readLine(stream, connection) {
@@ -172,6 +182,9 @@ export default class WindowsTouchpad {
             this._tray(msg, connection);
         } else if ('dark' in msg) { // {dark, wallpaper: its path under /mnt, v: its version}
             this._appearance(msg);
+        } else if ('s' in msg) { // {s: [dx, dy]} in wheel steps; mutter's scrolling counts 10 a step
+            this._pointer?.notify_scroll_continuous(GLib.get_monotonic_time(), msg.s[0] * 10, msg.s[1] * 10,
+                Clutter.ScrollSource.CONTINUOUS, Clutter.ScrollFinishFlags.NONE);
         } else if ('k' in msg) { // {k: evdev key code, down}
             this._keyboard.notify_key(GLib.get_monotonic_time(), msg.k,
                 msg.down ? Clutter.KeyState.PRESSED : Clutter.KeyState.RELEASED);

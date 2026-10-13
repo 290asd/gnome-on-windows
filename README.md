@@ -35,7 +35,7 @@ moved, tiled and closed by GNOME, while the apps themselves keep running on Wind
   ```
   GNOME 49 and later (Ubuntu 26.04 and newer) also need PipeWire and what `gnome-viewer.c` is built with:
   ```
-  sudo apt install pipewire wireplumber gcc pkg-config libpipewire-0.3-dev libglib2.0-dev libxcb1-dev libxcb-shm0-dev libxcb-render0-dev libxcb-render-util0-dev libxcb-xkb-dev
+  sudo apt install pipewire wireplumber gcc pkg-config libpipewire-0.3-dev libglib2.0-dev libxcb1-dev libxcb-shm0-dev libxcb-render0-dev libxcb-render-util0-dev libxcb-xkb-dev libxcb-xfixes0-dev
   ```
 - Python 3 on Windows (the `py` launcher), with:
   ```
@@ -98,8 +98,7 @@ moved, tiled and closed by GNOME, while the apps themselves keep running on Wind
 - Two mirrors side by side in GNOME can cover each other on the Windows side; then only the focused
   one keeps updating.
 - Assumes Linux user id 1000 and GNOME Shell 46 or 49 and later.
-- GNOME 49+: wheel scrolling only in steps (no smooth touchpad scrolling inside GNOME's own UI), and no
-  clipboard between Windows and GNOME's own Linux apps.
+- GNOME 49+: the clipboard between Windows and GNOME's own Linux apps carries text only.
 - Wi-Fi: GNOME joins personal (password) and open networks, and any network Windows has saved;
   an enterprise (802.1X) network has to be joined once in Windows' own settings. A saved network's
   settings can't be edited from GNOME (only connected, disconnected, forgotten). No wired, VPN or

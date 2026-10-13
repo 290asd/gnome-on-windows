@@ -40,7 +40,7 @@ if [ "$(gnome-shell --version | grep -o '[0-9]\+' | head -1)" -ge 49 ]; then
     if [ ! "$VIEWER" -nt "$GNOME_WINDOWS_DIR/gnome-viewer.c" ]; then
         mkdir -p "$(dirname "$VIEWER")"
         cc -O2 -o "$VIEWER" "$GNOME_WINDOWS_DIR/gnome-viewer.c" $(pkg-config --cflags --libs gio-unix-2.0 \
-            libpipewire-0.3 xcb xcb-shm xcb-render xcb-renderutil xcb-xkb) || exit 1
+            libpipewire-0.3 xcb xcb-shm xcb-render xcb-renderutil xcb-xkb xcb-xfixes) || exit 1
     fi
 fi
 # GNOME-only launchers ("Exit GNOME"); kept out of ~/.local so WSLg doesn't add them to Windows' Start menu

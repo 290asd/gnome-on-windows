@@ -4,15 +4,17 @@
  * gnome-shell runs headless; this asks it (ScreenCast RecordVirtual) for a virtual monitor of the window's size and
  * shows the frames GNOME sends over PipeWire. Mutter's buffers (memfd) go to WSLg's X server as they are (MIT-SHM by
  * fd: no copy here), and each goes back to mutter as soon as the server has read it, so GNOME already draws the next
- * frame while this one is shown. Input goes back through mutter's RemoteDesktop D-Bus API, GNOME's pointer image
- * comes as the stream's cursor metadata.
+ * frame while this one is shown. Input goes back through mutter's RemoteDesktop D-Bus API (the wheel in whole steps:
+ * WSLg rounds scrolling to those before X, so winbridge.py takes smooth scrolling over GNOME's window to the
+ * windows-touchpad extension instead), GNOME's pointer image comes as the stream's cursor metadata, and the
+ * clipboard is passed both ways between GNOME and the X server's CLIPBOARD, which WSLg links to Windows'.
  * mutter-devkit, mutter's own viewer, takes exactly two buffers, copies each, draws it with GTK and only then asks
- * for the next: 13 fps for a full-screen load here, where GNOME 46's --nested got 29.
+ * for the next: 13 fps for a full-screen load here, where GNOME 46's --nested got 29 and this gets 31.
  *
  *   gnome-viewer WIDTHxHEIGHT[@RATE] SCALE     inside GNOME's D-Bus session, next to gnome-shell --headless
  *
- * ponytail: one monitor, wheel steps only (no smooth touchpad scrolling: XInput 2), no clipboard; mutter-devkit
- * has those if they are ever missed.
+ * ponytail: one monitor; clipboard text only (WSLg's X server passes nothing else on to Windows), and GNOME's text
+ * handed to X in one piece (no INCR), up to the server's maximum request size (16 MB).
  */
 #include <linux/input-event-codes.h>
 #include <stdio.h>
@@ -21,6 +23,9 @@
 #include <unistd.h>
 
 #include <gio/gio.h>
+#include <gio/gunixfdlist.h>
+#include <gio/gunixinputstream.h>
+#include <gio/gunixoutputstream.h>
 #include <glib-unix.h>
 #include <pipewire/pipewire.h>
 #include <spa/buffer/meta.h>
@@ -29,6 +34,7 @@
 #include <xcb/shm.h>
 #include <xcb/xcb.h>
 #include <xcb/xcb_renderutil.h>
+#include <xcb/xfixes.h>
 #include <xcb/xkb.h>
 
 #define RD "org.gnome.Mutter.RemoteDesktop"
@@ -45,11 +51,20 @@ static char *rd_path, *stream_path;
 static xcb_connection_t *xc;
 static xcb_window_t win;
 static xcb_gcontext_t gc;
-static uint8_t shm_completion;
+static uint8_t shm_completion, xfixes_selection_notify;
 static xcb_render_pictformat_t argb32;
 static xcb_cursor_t cursor;
+static xcb_atom_t CLIPBOARD, TARGETS, UTF8_STRING, INCR, TRANSFER;
 static gboolean keys[256];
 static unsigned buttons;
+
+static char *gnome_text_type; /* GNOME's clipboard holds text of this type; we own CLIPBOARD for it */
+static struct {
+    GArray *serials; /* GNOME's requests for it (several of its parts ask at once), empty when none is under way */
+    gboolean incr;
+    GByteArray *data;
+    guint timeout;
+} paste; /* X's clipboard text on its way into GNOME */
 
 static struct pw_loop *pwl;
 static struct pw_core *pw_core;
@@ -252,6 +267,250 @@ static void rd_notify(const char *method, GVariant *args)
         g_variant_unref(g_variant_ref_sink(args));
 }
 
+/* a session method that answers with a file descriptor (clipboard transfers): done(fd or -1, data) */
+static void rd_call_fd(const char *method, GVariant *args, GAsyncReadyCallback done, gpointer data)
+{
+    g_dbus_connection_call_with_unix_fd_list(bus, RD, rd_path, RD ".Session", method, args, G_VARIANT_TYPE("(h)"),
+                                             G_DBUS_CALL_FLAGS_NONE, -1, NULL, NULL, done, data);
+}
+
+static int rd_call_fd_finish(GAsyncResult *res)
+{
+    GUnixFDList *fds = NULL;
+    GError *error = NULL;
+    GVariant *r = g_dbus_connection_call_with_unix_fd_list_finish(bus, &fds, res, &error);
+    int fd = -1;
+    if (r) {
+        gint32 handle;
+        g_variant_get(r, "(h)", &handle);
+        fd = g_unix_fd_list_get(fds, handle, &error);
+        g_variant_unref(r);
+    }
+    if (error) {
+        g_printerr("gnome-viewer: clipboard: %s\n", error->message);
+        g_error_free(error);
+    }
+    g_clear_object(&fds);
+    return fd;
+}
+
+/* --- clipboard: X (Windows) -> GNOME --- */
+
+static guint offer_pending;
+
+/* the X clipboard changed hands: GNOME can paste its text from us now. WSLg hands it over a few times for one copy
+ * in Windows, and each offer cancels GNOME's requests for the last one: offer once things have settled */
+static gboolean offer_x_text(gpointer data)
+{
+    offer_pending = 0;
+    const char *types[] = {"text/plain;charset=utf-8", "text/plain", NULL};
+    GVariantBuilder props;
+    g_variant_builder_init(&props, G_VARIANT_TYPE_VARDICT);
+    g_variant_builder_add(&props, "{sv}", "mime-types", g_variant_new_strv(types, -1));
+    rd_notify("SetSelection", g_variant_new("(a{sv})", &props));
+    return G_SOURCE_REMOVE;
+}
+
+struct paste_write {
+    guint32 serial;
+    GBytes *text;
+};
+
+static void paste_written(GObject *out, GAsyncResult *res, gpointer data)
+{
+    struct paste_write *w = data;
+    GError *error = NULL;
+    gboolean ok = g_output_stream_write_all_finish(G_OUTPUT_STREAM(out), res, NULL, &error);
+    if (!ok) {
+        g_printerr("gnome-viewer: clipboard: %s\n", error->message);
+        g_error_free(error);
+    }
+    g_output_stream_close(G_OUTPUT_STREAM(out), NULL, NULL); /* EOF: GNOME has it all */
+    rd_notify("SelectionWriteDone", g_variant_new("(ub)", w->serial, ok));
+    g_object_unref(out);
+    g_bytes_unref(w->text);
+    g_free(w);
+}
+
+static void paste_fd(GObject *src, GAsyncResult *res, gpointer data)
+{
+    struct paste_write *w = data;
+    int fd = rd_call_fd_finish(res);
+    if (fd < 0) {
+        rd_notify("SelectionWriteDone", g_variant_new("(ub)", w->serial, FALSE));
+        g_bytes_unref(w->text);
+        g_free(w);
+        return;
+    }
+    GOutputStream *out = g_unix_output_stream_new(fd, TRUE);
+    gsize n;
+    const void *text = g_bytes_get_data(w->text, &n);
+    g_output_stream_write_all_async(out, text, n, G_PRIORITY_DEFAULT, NULL, paste_written, w);
+}
+
+static void paste_done(gboolean ok)
+{
+    if (!paste.serials->len)
+        return;
+    if (paste.timeout)
+        g_source_remove(paste.timeout);
+    paste.timeout = 0;
+    GBytes *text = g_byte_array_free_to_bytes(paste.data);
+    paste.data = NULL;
+    for (guint i = 0; i < paste.serials->len; i++) {
+        guint32 serial = g_array_index(paste.serials, guint32, i);
+        if (!ok) {
+            rd_notify("SelectionWriteDone", g_variant_new("(ub)", serial, FALSE));
+            continue;
+        }
+        struct paste_write *w = g_new0(struct paste_write, 1);
+        w->serial = serial;
+        w->text = g_bytes_ref(text);
+        rd_call_fd("SelectionWrite", g_variant_new("(u)", serial), paste_fd, w);
+    }
+    g_array_set_size(paste.serials, 0);
+    g_bytes_unref(text);
+}
+
+static gboolean paste_timed_out(gpointer data)
+{
+    paste.timeout = 0;
+    paste_done(FALSE);
+    return G_SOURCE_REMOVE;
+}
+
+/* GNOME pastes: fetch the text from the X clipboard's owner, then hand it over */
+static void on_transfer(GDBusConnection *c, const char *sender, const char *path, const char *iface,
+                        const char *signal, GVariant *args, gpointer data)
+{
+    guint32 serial;
+    g_variant_get(args, "(&su)", NULL, &serial);
+    g_array_append_val(paste.serials, serial);
+    if (paste.serials->len > 1)
+        return; /* the text is already on its way */
+    paste.incr = FALSE;
+    paste.data = g_byte_array_new();
+    paste.timeout = g_timeout_add_seconds(5, paste_timed_out, NULL);
+    xcb_convert_selection(xc, win, CLIPBOARD, UTF8_STRING, TRANSFER, XCB_CURRENT_TIME);
+    xcb_flush(xc);
+}
+
+static void read_paste_property(void) /* the whole text, or one chunk of a large (INCR) transfer */
+{
+    xcb_get_property_reply_t *p = xcb_get_property_reply(
+        xc, xcb_get_property(xc, 1, win, TRANSFER, XCB_GET_PROPERTY_TYPE_ANY, 0, UINT32_MAX / 4), NULL);
+    if (!p) {
+        paste_done(FALSE);
+        return;
+    }
+    if (p->type == INCR) { /* deleting the property asked for the first chunk */
+        paste.incr = TRUE;
+    } else {
+        int n = xcb_get_property_value_length(p);
+        g_byte_array_append(paste.data, xcb_get_property_value(p), n);
+        if (!paste.incr || !n) /* an INCR transfer ends with an empty chunk */
+            paste_done(TRUE);
+    }
+    free(p);
+}
+
+/* --- clipboard: GNOME -> X (Windows) --- */
+
+static void on_gnome_selection(GDBusConnection *c, const char *sender, const char *path, const char *iface,
+                               const char *signal, GVariant *args, gpointer data)
+{
+    GVariant *options;
+    gboolean ours = FALSE;
+    const char **types = NULL;
+    g_variant_get(args, "(@a{sv})", &options);
+    g_variant_lookup(options, "session-is-owner", "b", &ours);
+    if (!g_variant_lookup(options, "mime-types", "(^a&s)", &types)) /* mutter 50 sends (as), its docs say as */
+        g_variant_lookup(options, "mime-types", "^a&s", &types);
+    if (!ours) { /* a GNOME app copied something: hold the X clipboard for it if it is text */
+        static const char *const text_types[] = {"text/plain;charset=utf-8", "UTF8_STRING", "text/plain", "STRING"};
+        g_clear_pointer(&gnome_text_type, g_free); /* no text: we keep the X clipboard, but refuse to give it */
+        for (unsigned i = 0; i < G_N_ELEMENTS(text_types) && types && !gnome_text_type; i++)
+            if (g_strv_contains(types, text_types[i]))
+                gnome_text_type = g_strdup(text_types[i]);
+        /* Never no owner at all: WSLg's Weston crashed (all its windows, GNOME's too) when we let go of it.
+         * The current time: WSLg takes the clipboard after our last input event when Windows' changes, and the
+         * server ignores a request with an older time. */
+        if (gnome_text_type) {
+            xcb_set_selection_owner(xc, win, CLIPBOARD, XCB_CURRENT_TIME);
+            xcb_flush(xc);
+        }
+    }
+    g_free(types);
+    g_variant_unref(options);
+}
+
+static void answer(const xcb_selection_request_event_t *r, xcb_atom_t property) /* XCB_NONE: refused */
+{
+    xcb_selection_notify_event_t n = {.response_type = XCB_SELECTION_NOTIFY, .time = r->time,
+                                      .requestor = r->requestor, .selection = r->selection, .target = r->target,
+                                      .property = property};
+    xcb_send_event(xc, 0, r->requestor, XCB_EVENT_MASK_NO_EVENT, (const char *)&n);
+    xcb_flush(xc);
+}
+
+struct copy_request {
+    xcb_selection_request_event_t request;
+    xcb_atom_t property;
+    GOutputStream *text;
+};
+
+static void copy_read(GObject *text, GAsyncResult *res, gpointer data)
+{
+    struct copy_request *q = data;
+    gboolean ok = g_output_stream_splice_finish(G_OUTPUT_STREAM(text), res, NULL) >= 0;
+    gsize n = g_memory_output_stream_get_data_size(G_MEMORY_OUTPUT_STREAM(text));
+    if (ok && n < (gsize)xcb_get_maximum_request_length(xc) * 4 - 64) {
+        xcb_change_property(xc, XCB_PROP_MODE_REPLACE, q->request.requestor, q->property, UTF8_STRING, 8, n,
+                            g_memory_output_stream_get_data(G_MEMORY_OUTPUT_STREAM(text)));
+        answer(&q->request, q->property);
+    } else {
+        answer(&q->request, XCB_NONE);
+    }
+    g_object_unref(text);
+    g_free(q);
+}
+
+static void copy_fd(GObject *src, GAsyncResult *res, gpointer data)
+{
+    struct copy_request *q = data;
+    int fd = rd_call_fd_finish(res);
+    if (fd < 0) {
+        answer(&q->request, XCB_NONE);
+        g_free(q);
+        return;
+    }
+    GInputStream *in = g_unix_input_stream_new(fd, TRUE);
+    q->text = g_memory_output_stream_new_resizable();
+    g_output_stream_splice_async(q->text, in, G_OUTPUT_STREAM_SPLICE_CLOSE_SOURCE, G_PRIORITY_DEFAULT, NULL,
+                                 copy_read, q);
+    g_object_unref(in);
+}
+
+/* Windows (through WSLg) wants the text a GNOME app copied: read it from GNOME, put it on the requestor */
+static void selection_request(const xcb_selection_request_event_t *r)
+{
+    xcb_atom_t property = r->property ? r->property : r->target; /* obsolete requestors leave it out */
+    if (r->target == TARGETS) {
+        xcb_atom_t targets[] = {TARGETS, UTF8_STRING};
+        xcb_change_property(xc, XCB_PROP_MODE_REPLACE, r->requestor, property, XCB_ATOM_ATOM, 32, 2, targets);
+        answer(r, property);
+    } else if (r->target == UTF8_STRING && gnome_text_type && rd_path) {
+        struct copy_request *q = g_new0(struct copy_request, 1);
+        q->request = *r;
+        q->property = property;
+        rd_call_fd("SelectionRead", g_variant_new("(s)", gnome_text_type), copy_fd, q);
+    } else {
+        answer(r, XCB_NONE);
+    }
+}
+
+/* --- D-Bus: the session --- */
+
 static void on_closed(GDBusConnection *c, const char *sender, const char *path, const char *iface,
                       const char *signal, GVariant *args, gpointer data)
 {
@@ -301,8 +560,28 @@ static void start(GDBusConnection *c, const char *name, const char *owner, gpoin
                                        G_DBUS_SIGNAL_FLAGS_NONE, on_stream_added, NULL, NULL);
     g_dbus_connection_signal_subscribe(bus, RD, RD ".Session", "Closed", rd_path, NULL, G_DBUS_SIGNAL_FLAGS_NONE,
                                        on_closed, NULL, NULL);
-    if ((r = call(RD, rd_path, RD ".Session", "Start", NULL, NULL)))
+    g_dbus_connection_signal_subscribe(bus, RD, RD ".Session", "SelectionOwnerChanged", rd_path, NULL,
+                                       G_DBUS_SIGNAL_FLAGS_NONE, on_gnome_selection, NULL, NULL);
+    g_dbus_connection_signal_subscribe(bus, RD, RD ".Session", "SelectionTransfer", rd_path, NULL,
+                                       G_DBUS_SIGNAL_FLAGS_NONE, on_transfer, NULL, NULL);
+    if (!(r = call(RD, rd_path, RD ".Session", "Start", NULL, NULL)))
+        return;
+    g_variant_unref(r);
+
+    GError *error = NULL; /* without a clipboard GNOME is still usable */
+    if ((r = g_dbus_connection_call_sync(bus, RD, rd_path, RD ".Session", "EnableClipboard",
+                                         g_variant_new("(a{sv})", NULL), NULL, G_DBUS_CALL_FLAGS_NONE, -1, NULL,
+                                         &error))) {
         g_variant_unref(r);
+        xcb_get_selection_owner_reply_t *o =
+            xcb_get_selection_owner_reply(xc, xcb_get_selection_owner(xc, CLIPBOARD), NULL);
+        if (o && o->owner != XCB_NONE && o->owner != win) /* Windows' clipboard already holds text */
+            offer_x_text(NULL);
+        free(o);
+    } else {
+        g_printerr("gnome-viewer: no clipboard: %s\n", error->message);
+        g_error_free(error);
+    }
 }
 
 static void vanished(GDBusConnection *c, const char *name, gpointer data)
@@ -310,6 +589,8 @@ static void vanished(GDBusConnection *c, const char *name, gpointer data)
     if (rd_path)
         g_main_loop_quit(loop); /* gnome-shell is gone */
 }
+
+/* --- input --- */
 
 static void key(int keycode, gboolean down)
 {
@@ -353,6 +634,15 @@ static void handle(xcb_generic_event_t *e)
         show_next();
         return;
     }
+    if (type == xfixes_selection_notify) {
+        xcb_xfixes_selection_notify_event_t *n = (xcb_xfixes_selection_notify_event_t *)e;
+        if (n->owner != XCB_NONE && n->owner != win && rd_path) {
+            if (offer_pending)
+                g_source_remove(offer_pending);
+            offer_pending = g_timeout_add(50, offer_x_text, NULL);
+        }
+        return;
+    }
     switch (type) {
     case 0: {
         xcb_generic_error_t *err = (xcb_generic_error_t *)e;
@@ -377,6 +667,26 @@ static void handle(xcb_generic_event_t *e)
     case XCB_FOCUS_OUT:
         release_all();
         break;
+    case XCB_SELECTION_REQUEST:
+        selection_request((xcb_selection_request_event_t *)e);
+        break;
+    case XCB_SELECTION_CLEAR: /* Windows (or another X client) has the clipboard now */
+        g_clear_pointer(&gnome_text_type, g_free);
+        break;
+    case XCB_SELECTION_NOTIFY: /* the X clipboard's answer to on_transfer */
+        if (!paste.serials->len)
+            break;
+        if (((xcb_selection_notify_event_t *)e)->property == XCB_NONE)
+            paste_done(FALSE);
+        else
+            read_paste_property();
+        break;
+    case XCB_PROPERTY_NOTIFY: {
+        xcb_property_notify_event_t *p = (xcb_property_notify_event_t *)e;
+        if (paste.serials->len && paste.incr && p->atom == TRANSFER && p->state == XCB_PROPERTY_NEW_VALUE)
+            read_paste_property(); /* the next chunk */
+        break;
+    }
     case XCB_CLIENT_MESSAGE: /* WM_DELETE_WINDOW, the only protocol set */
         g_main_loop_quit(loop);
         break;
@@ -438,25 +748,29 @@ static gboolean init_x(void)
     free(xcb_xkb_per_client_flags_reply(xc, xcb_xkb_per_client_flags(xc, XCB_XKB_ID_USE_CORE_KBD,
         XCB_XKB_PER_CLIENT_FLAG_DETECTABLE_AUTO_REPEAT, XCB_XKB_PER_CLIENT_FLAG_DETECTABLE_AUTO_REPEAT, 0, 0, 0),
         NULL));
+    free(xcb_xfixes_query_version_reply(xc, xcb_xfixes_query_version(xc, 5, 0), NULL));
+    xfixes_selection_notify = xcb_get_extension_data(xc, &xcb_xfixes_id)->first_event + XCB_XFIXES_SELECTION_NOTIFY;
+    CLIPBOARD = atom("CLIPBOARD"), TARGETS = atom("TARGETS"), UTF8_STRING = atom("UTF8_STRING"), INCR = atom("INCR");
+    TRANSFER = atom("GNOME_VIEWER_PASTE");
 
     xcb_screen_t *screen = xcb_setup_roots_iterator(xcb_get_setup(xc)).data;
     win = xcb_generate_id(xc);
     uint32_t values[] = {XCB_BACK_PIXMAP_NONE,
                          XCB_EVENT_MASK_KEY_PRESS | XCB_EVENT_MASK_KEY_RELEASE | XCB_EVENT_MASK_BUTTON_PRESS |
                              XCB_EVENT_MASK_BUTTON_RELEASE | XCB_EVENT_MASK_POINTER_MOTION |
-                             XCB_EVENT_MASK_FOCUS_CHANGE};
+                             XCB_EVENT_MASK_FOCUS_CHANGE | XCB_EVENT_MASK_PROPERTY_CHANGE};
     xcb_create_window(xc, XCB_COPY_FROM_PARENT, win, screen->root, 0, 0, width, height, 0,
                       XCB_WINDOW_CLASS_INPUT_OUTPUT, screen->root_visual, XCB_CW_BACK_PIXMAP | XCB_CW_EVENT_MASK,
                       values);
     /* the name WSLg gives the Windows window, "gnome-shell (<distro>)": winbridge.py finds GNOME by it */
     const char name[] = "gnome-shell", class[] = "gnome-shell\0gnome-shell";
     xcb_change_property(xc, XCB_PROP_MODE_REPLACE, win, XCB_ATOM_WM_NAME, XCB_ATOM_STRING, 8, strlen(name), name);
-    xcb_change_property(xc, XCB_PROP_MODE_REPLACE, win, atom("_NET_WM_NAME"), atom("UTF8_STRING"), 8,
-                        strlen(name), name);
+    xcb_change_property(xc, XCB_PROP_MODE_REPLACE, win, atom("_NET_WM_NAME"), UTF8_STRING, 8, strlen(name), name);
     xcb_change_property(xc, XCB_PROP_MODE_REPLACE, win, XCB_ATOM_WM_CLASS, XCB_ATOM_STRING, 8, sizeof(class), class);
     xcb_atom_t delete_window = atom("WM_DELETE_WINDOW"), fullscreen = atom("_NET_WM_STATE_FULLSCREEN");
     xcb_change_property(xc, XCB_PROP_MODE_REPLACE, win, atom("WM_PROTOCOLS"), XCB_ATOM_ATOM, 32, 1, &delete_window);
     xcb_change_property(xc, XCB_PROP_MODE_REPLACE, win, atom("_NET_WM_STATE"), XCB_ATOM_ATOM, 32, 1, &fullscreen);
+    xcb_xfixes_select_selection_input(xc, win, CLIPBOARD, XCB_XFIXES_SELECTION_EVENT_MASK_SET_SELECTION_OWNER);
     gc = xcb_generate_id(xc);
     xcb_create_gc(xc, gc, win, 0, NULL);
     xcb_map_window(xc, win);
@@ -473,6 +787,7 @@ int main(int argc, char **argv)
     }
     pw_init(&argc, &argv);
     loop = g_main_loop_new(NULL, FALSE);
+    paste.serials = g_array_new(FALSE, FALSE, sizeof(guint32));
     if (!init_x())
         return 1;
     pwl = pw_loop_new(NULL);

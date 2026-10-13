@@ -169,6 +169,23 @@ front[0] = 1                                                                # GN
 assert [key(0xA4, True), key(0x09, True), key(0x09, False), key(0xA4, False)] == [0] * 4
 assert keys == [], keys
 
+# wheel over GNOME's own window: to GNOME in fractions of a step, once the extension can scroll smoothly
+winbridge.overlay.hwnd, under = 0, [1]
+winbridge.user32 = types.SimpleNamespace(WindowFromPoint=lambda pt: under[0], GetAncestor=lambda h, flags: h,
+                                         CallNextHookEx=lambda *a: 0)
+scrolls = Shell()
+scrolls.smooth = False
+wheel = winbridge.GnomeWheel(scrolls)
+def turn(delta, horizontal=False):
+    m = winbridge.MSLLHOOKSTRUCT(winbridge.wt.POINT(5, 5), (delta & 0xFFFF) << 16, 0, 0, 0)
+    return wheel.hook(0, 0x20E if horizontal else 0x20A, winbridge.ctypes.addressof(m))
+assert turn(-30) == 0 and scrolls == []                                     # GNOME 46: WSLg's whole steps
+scrolls.smooth = True
+assert [turn(-30), turn(120), turn(60, horizontal=True)] == [1, 1, 1]       # a quarter down, a step up, half right
+assert scrolls == [{"s": [0, 0.25]}, {"s": [0, -1.0]}, {"s": [0.5, 0]}], scrolls
+under[0] = 2                                                                # the native window is under the pointer
+assert turn(120) == 0 and len(scrolls) == 3
+
 # Windows' look for GNOME: dark mode, wallpaper as a WSL path with a version that follows the file
 import os, tempfile
 reg = {}
